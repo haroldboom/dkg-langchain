@@ -35,8 +35,8 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Mungles/dkg-langchain"
-Documentation = "https://github.com/Mungles/dkg-langchain#readme"
+Repository = "https://github.com/haroldboom/dkg-langchain"
+Documentation = "https://github.com/haroldboom/dkg-langchain#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/langchain_dkg"]
