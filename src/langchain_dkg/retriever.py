@@ -74,11 +74,11 @@ class DKGRetriever(BaseRetriever):
             include_workspace=self.include_workspace,
         )
         docs: list[Document] = []
-        bindings = result.get("results", {}).get("bindings", [])
+        bindings = result.get("result", {}).get("bindings", [])
         for binding in bindings:
-            subject = binding.get("subject", {}).get("value", "")
-            predicate = binding.get("predicate", {}).get("value", "")
-            obj = binding.get("object", {}).get("value", "")
+            subject = binding.get("subject", "")
+            predicate = binding.get("predicate", "")
+            obj = binding.get("object", "")
             page_content = f"{subject} {predicate} {obj}"
             docs.append(
                 Document(

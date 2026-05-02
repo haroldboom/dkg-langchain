@@ -81,28 +81,33 @@ async def demo_chat_history(client: DKGClient) -> None:
             layer="wm",
         )
         ok(f"UAL: {result['turnUri']}")
-        info(f"Structural triples: {result['structuralTripleCount']}  "
-             f"Semantic: {result['semanticTripleCount']}  "
-             f"Embeddings: {result['embeddingId'][:20]}...")
+        file_hash = result.get("fileHash", "")
+        info(f"Hash  : {file_hash[:52]}...")
+        info(f"Quads : {result['totalQuads']}  |  layer: {result['layer']}")
         print()
         pause(0.7)
 
     pause(0.5)
     step("Semantic search: \"Knowledge Asset\"")
     pause(0.5)
-    result = await client.memory_search(
+    search_result = await client.memory_search(
         context_graph_id=CONTEXT_GRAPH,
         query="Knowledge Asset",
         limit=4,
     )
-    ok(f"Retrieved {result.get('resultCount', 0)} relevant turns:\n")
-    for item in result.get("results", []):
-        snippet = item.get("snippet") or item.get("label", "")
-        sim = item.get("similarity", 0.0)
-        print(f"    [{sim:.2f}]  {snippet[:72]}...")
-        print(f"           UAL: {item['entityUri']}")
+    count = search_result.get("resultCount", 0)
+    if count:
+        ok(f"Retrieved {count} relevant turns:\n")
+        for item in search_result.get("results", []):
+            snippet = item.get("snippet") or item.get("label", "")
+            sim = item.get("similarity", 0.0)
+            print(f"    [{sim:.2f}]  {snippet[:72]}...")
+            print(f"           UAL: {item['entityUri']}")
+            print()
+            pause(0.3)
+    else:
+        info("Search index building — embeddings generated asynchronously after ingestion.")
         print()
-        pause(0.3)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -121,7 +126,7 @@ async def demo_memory_chain(client: DKGClient) -> None:
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
         llm_label = "gpt-4o-mini"
     else:
-        from langchain_core.language_models.fake import FakeListChatModel
+        from langchain_core.language_models.fake_chat_models import FakeListChatModel
         llm = FakeListChatModel(responses=[
             "DKG v10 has three memory layers: Working Memory (local and private), "
             "Shared Working Memory (gossip-replicated across trusted peers), and "
@@ -182,7 +187,7 @@ async def demo_retriever(client: DKGClient) -> None:
 
     retriever = DKGRetriever(client=client, limit=6, include_workspace=True)
 
-    for query in ["OriginTrail", "Knowledge Asset"]:
+    for query in ["DKG", "Testnet"]:
         step(f"Query: \"{query}\"")
         pause(0.4)
         docs = await retriever._aget_relevant_documents(query)
