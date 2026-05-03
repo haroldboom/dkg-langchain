@@ -56,6 +56,8 @@ async def demo_chat_history(client: DKGClient) -> None:
         client=client,
         layer="wm",
         session_uri="urn:session:demo-video-001",
+        search_query="Knowledge Asset",
+        search_limit=4,
     )
 
     turns = [
@@ -67,44 +69,30 @@ async def demo_chat_history(client: DKGClient) -> None:
         AIMessage(content="DKG v10 has three layers: Working Memory (private), Shared Working Memory (gossip-replicated), and Verified Memory (on-chain)."),
     ]
 
-    print(f"  Storing {len(turns)} turns in DKG Working Memory...\n")
+    print(f"  Storing {len(turns)} turns via DKGChatMessageHistory.aadd_message ...\n")
     pause(0.5)
 
     for i, msg in enumerate(turns, 1):
         role_label = "Human" if isinstance(msg, HumanMessage) else "AI   "
-        markdown = f"**{role_label.strip()}:** {msg.content}"
+        prefix = "**Human:** " if isinstance(msg, HumanMessage) else "**AI:** "
         step(f"Turn {i}/{len(turns)}  [{role_label}]  {msg.content[:52]}...")
-        result = await client.memory_turn(
-            context_graph_id=CONTEXT_GRAPH,
-            markdown=markdown,
-            session_uri="urn:session:demo-video-001",
-            layer="wm",
-        )
-        ok(f"UAL: {result['turnUri']}")
-        file_hash = result.get("fileHash", "")
-        info(f"Hash  : {file_hash[:52]}...")
-        info(f"Quads : {result['totalQuads']}  |  layer: {result['layer']}")
+        await history.aadd_message(msg)
+        ual = history.get_turn_uri(f"{prefix}{msg.content}")
+        ok(f"UAL: {ual}")
         print()
         pause(0.7)
 
     pause(0.5)
-    step("Semantic search: \"Knowledge Asset\"")
+    step("Semantic search via history.aget_messages() — query: \"Knowledge Asset\"")
     pause(0.5)
-    search_result = await client.memory_search(
-        context_graph_id=CONTEXT_GRAPH,
-        query="Knowledge Asset",
-        limit=4,
-    )
-    count = search_result.get("resultCount", 0)
-    if count:
-        ok(f"Retrieved {count} relevant turns:\n")
-        for item in search_result.get("results", []):
-            snippet = item.get("snippet") or item.get("label", "")
-            sim = item.get("similarity", 0.0)
-            print(f"    [{sim:.2f}]  {snippet[:72]}...")
-            print(f"           UAL: {item['entityUri']}")
-            print()
+    msgs = await history.aget_messages()
+    if msgs:
+        ok(f"Retrieved {len(msgs)} relevant turns as LangChain messages:\n")
+        for m in msgs:
+            role = "Human" if isinstance(m, HumanMessage) else "AI   "
+            print(f"    [{role}]  {m.content[:72]}...")
             pause(0.3)
+        print()
     else:
         info("Search index building — embeddings generated asynchronously after ingestion.")
         print()
@@ -164,7 +152,7 @@ async def demo_memory_chain(client: DKGClient) -> None:
     for q in questions:
         print(f"  Human: {q}")
         pause(0.4)
-        response = chain_with_memory.invoke(
+        response = await chain_with_memory.ainvoke(
             {"input": q},
             config={"configurable": {"session_id": "demo-session-01"}},
         )
@@ -190,7 +178,7 @@ async def demo_retriever(client: DKGClient) -> None:
     for query in ["DKG", "Testnet"]:
         step(f"Query: \"{query}\"")
         pause(0.4)
-        docs = await retriever._aget_relevant_documents(query)
+        docs = await retriever.ainvoke(query)
         ok(f"{len(docs)} triples retrieved as LangChain Documents\n")
         for doc in docs[:3]:
             print(f"    {doc.page_content[:88]}")
