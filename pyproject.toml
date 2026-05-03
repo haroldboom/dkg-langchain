@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-dkg"
-version = "0.1.0"
+version = "0.1.1"
 description = "LangChain memory and retriever backed by OriginTrail DKG v10 Working Memory"
 readme = "README.md"
 license = { text = "MIT" }

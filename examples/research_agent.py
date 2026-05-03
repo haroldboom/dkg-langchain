@@ -57,7 +57,8 @@ async def run_demo():
     for role, content in turns:
         msg = HumanMessage(content=content) if role == "human" else AIMessage(content=content)
         await history.aadd_message(msg)
-        ual = history.get_ual(role, content)
+        prefix = "**Human:** " if role == "human" else "**AI:** "
+        ual = history.get_turn_uri(f"{prefix}{content}")
         print(f"  [{role}] stored → UAL: {ual}")
 
     print("\nRetrieving relevant history for 'Knowledge Asset'...")

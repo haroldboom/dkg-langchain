@@ -2,40 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any, Coroutine, Sequence, TypeVar
-
-_T = TypeVar("_T")
-
-
-def _run_sync(coro: Coroutine[Any, Any, _T]) -> _T:
-    """Run a coroutine synchronously in all contexts.
-
-    Handles three situations:
-    - No event loop in thread (Python 3.10+ threads): create one.
-    - Event loop present but not running (main thread, scripts): use it.
-    - Event loop already running (LangChain thread-pool callbacks, Jupyter):
-      run in a fresh thread so the inner loop doesn't conflict.
-    """
-    import concurrent.futures
-
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("closed")
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    if loop.is_running():
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, coro).result()
-
-    return loop.run_until_complete(coro)
+from typing import Any, Sequence
 
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 
+from ._sync import run_sync
 from .client import DKGClient
 
 # Role prefixes embedded in the stored Markdown so role can be recovered on search.
@@ -107,7 +79,7 @@ class DKGChatMessageHistory(BaseChatMessageHistory):
     @property
     def messages(self) -> list[BaseMessage]:
         """Retrieve conversation history from DKG (synchronous wrapper)."""
-        return _run_sync(self.aget_messages())
+        return run_sync(self.aget_messages())
 
     async def aget_messages(self) -> list[BaseMessage]:
         result = await self.client.memory_search(
@@ -128,7 +100,7 @@ class DKGChatMessageHistory(BaseChatMessageHistory):
 
     def add_message(self, message: BaseMessage) -> None:
         """Store a single message in DKG Working Memory (synchronous wrapper)."""
-        _run_sync(self.aadd_message(message))
+        run_sync(self.aadd_message(message))
 
     async def aadd_message(self, message: BaseMessage) -> None:
         _, markdown = _message_to_markdown(message)

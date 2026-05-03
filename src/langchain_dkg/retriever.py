@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
+from pydantic import ConfigDict
 
+from ._sync import run_sync
 from .client import DKGClient
 
 
@@ -19,6 +21,17 @@ WHERE {{
 }}
 LIMIT {limit}
 """
+
+
+def _escape_sparql_literal(s: str) -> str:
+    """Escape a string for safe use inside a SPARQL double-quoted literal."""
+    return (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
 
 
 class DKGRetriever(BaseRetriever):
@@ -52,21 +65,34 @@ class DKGRetriever(BaseRetriever):
     graph_suffix: str | None = None
     include_workspace: bool = True
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def __init__(self, **data: Any) -> None:
         super().__init__(**data)
         if self.client is None:
-            object.__setattr__(self, "client", DKGClient())
+            self.client = DKGClient()
 
-    def _get_relevant_documents(self, query: str) -> list[Document]:
-        return asyncio.get_event_loop().run_until_complete(
-            self._aget_relevant_documents(query)
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun,
+    ) -> list[Document]:
+        return run_sync(self._aget_relevant_documents_impl(query))
+
+    async def _aget_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun | None = None,
+    ) -> list[Document]:
+        return await self._aget_relevant_documents_impl(query)
+
+    async def _aget_relevant_documents_impl(self, query: str) -> list[Document]:
+        sparql = self.sparql_template.format(
+            query=_escape_sparql_literal(query),
+            limit=self.limit,
         )
-
-    async def _aget_relevant_documents(self, query: str) -> list[Document]:
-        sparql = self.sparql_template.format(query=query, limit=self.limit)
         result = await self.client.query(
             sparql=sparql,
             paranet_id=self.paranet_id,
@@ -74,12 +100,16 @@ class DKGRetriever(BaseRetriever):
             include_workspace=self.include_workspace,
         )
         docs: list[Document] = []
-        bindings = result.get("result", {}).get("bindings", [])
+        bindings = result.get("results", {}).get("bindings", [])
         for binding in bindings:
-            subject = binding.get("subject", "")
-            predicate = binding.get("predicate", "")
-            obj = binding.get("object", "")
-            page_content = f"{subject} {predicate} {obj}"
+            values = {var: cell.get("value", "") for var, cell in binding.items()}
+            subject = values.get("subject", "")
+            predicate = values.get("predicate", "")
+            obj = values.get("object", "")
+            if subject or predicate or obj:
+                page_content = f"{subject} {predicate} {obj}".strip()
+            else:
+                page_content = " ".join(values.values()).strip()
             docs.append(
                 Document(
                     page_content=page_content,

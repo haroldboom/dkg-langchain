@@ -234,7 +234,7 @@ async def main() -> None:
     print("  All conversation turns stored as Knowledge Assets on the DKG.")
     print(f"  Context Graph: {CONTEXT_GRAPH}\n")
     print("  Install :  pip install langchain-dkg")
-    print("  GitHub  :  https://github.com/Mungles/dkg-langchain")
+    print("  GitHub  :  https://github.com/haroldboom/dkg-langchain")
     print("  Bounty  :  cfi-dkgv10-r1")
     print()
 

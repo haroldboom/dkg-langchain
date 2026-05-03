@@ -17,7 +17,7 @@ Usage::
         ("human", "{input}"),
     ])
     chain = prompt | llm
-    chain_with_memory = DKGMemory.wrap(
+    chain_with_memory = DKGMemory.wrap_chain(
         chain,
         context_graph_id="my-project",
         history_messages_key="history",
@@ -47,7 +47,9 @@ class DKGMemory:
         client: Pre-configured DKGClient (built from env vars if omitted).
         search_limit: Max turns to retrieve per chain call.
         sub_graph_name: Optional sub-graph name within the Context Graph.
-        layer: Memory layer filter ("working", "shared", "verified").
+        layer: Memory layer for stored turns — "wm" (Working Memory, private)
+            or "swm" (Shared Working Memory, gossiped). Defaults to the node's
+            default ("swm") when omitted.
     """
 
     def __init__(
