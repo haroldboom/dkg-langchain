@@ -1,5 +1,10 @@
 # langchain-dkg
 
+[![CI](https://github.com/haroldboom/dkg-langchain/actions/workflows/ci.yml/badge.svg)](https://github.com/haroldboom/dkg-langchain/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/langchain-dkg.svg)](https://pypi.org/project/langchain-dkg/)
+[![Python](https://img.shields.io/pypi/pyversions/langchain-dkg.svg)](https://pypi.org/project/langchain-dkg/)
+[![License](https://img.shields.io/pypi/l/langchain-dkg.svg)](https://github.com/haroldboom/dkg-langchain/blob/master/LICENSE)
+
 LangChain memory and retriever backed by [OriginTrail DKG v10](https://origintrail.io) Working Memory.
 
 Give any LangChain agent persistent, verifiable, queryable memory — every conversation turn stored as a cryptographically-linked Knowledge Asset on the Decentralized Knowledge Graph.
