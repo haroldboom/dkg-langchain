@@ -142,3 +142,16 @@ All code and documentation uses the exact DKG v10 terminology:
 ## 9. Maintenance commitment
 
 Six-month support window from submission date. Issues and PRs will be reviewed within 5 business days. The package follows semantic versioning; breaking changes will be released as major versions with migration notes.
+
+---
+
+## 10. Positioning vs other Round 1 submissions
+
+The Round 1 queue covers several distinct integration shapes. This submission is intentionally complementary, not competing:
+
+- **Source-side ingestion submissions** (`dkg-arxiv` for papers, `github-dkg` for engineering tacit knowledge, `tracabot` for Telegram moderation, `polymarket-analysis` for markets) populate DKG with upstream material. `langchain-dkg` is the **read-side** counterpart: any LangChain agent built on top can immediately consume that material as memory, retrieval, or RAG context. The two halves close a write/read loop.
+- **Agent-plugin submissions** (`openclaw-working-memory`, `dkg-wm-bridge`, `aipharmagent`) bind WM/SWM access to specific agent frameworks (OpenClaw, Hermes, clinical workflows). `langchain-dkg` targets the broader LangChain ecosystem — the dominant production framework for Python LLM apps — which is currently unaddressed in the queue.
+- **Platform-level governance submissions** (`agience-flare`, `repnet`) govern which artifacts reach DKG and how trust is assigned to them. `langchain-dkg` operates one layer below: assuming such governance is in place, it provides the standard adapter that lets a LangChain agent author and retrieve through the governed pipeline.
+- **First-party `cursor-mcp-dkg`** serves MCP-protocol clients (Cursor, Claude Code, Claude Desktop). `langchain-dkg` serves the orthogonal Python `BaseChatMessageHistory` / `BaseRetriever` interfaces — not MCP-based, no client overlap.
+
+This entry is the only LangChain-framework adapter in the queue. Its value is amplification: every other source-side, agent-plugin, or governance integration in this round becomes consumable by any LangChain agent the moment `langchain-dkg` lands.
