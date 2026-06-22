@@ -5,7 +5,12 @@ import respx
 import httpx
 import json
 
-from langchain_dkg.client import DKGClient
+from langchain_dkg.client import (
+    CuratorAckError,
+    CuratorRejectedError,
+    CuratorUnconfirmedError,
+    DKGClient,
+)
 
 
 BASE = "http://localhost:9200"
@@ -192,3 +197,72 @@ async def test_assertion_write_sends_quads_objects(client):
     body = json.loads(respx.calls.last.request.content)
     assert body["contextGraphId"] == "cg-1"
     assert body["quads"] == [{"subject": "ex:s", "predicate": "ex:p", "object": '"v"'}]
+
+
+# ---------------------------------------------------------------------------
+# Curator-ack mapping (OT-RFC-49 curator-leader)
+#
+# The SHARE/PUBLISH write paths return 503 CURATOR_UNCONFIRMED / 409
+# CURATOR_REJECTED (node rc.19+) instead of persisting. These map to typed,
+# catchable exceptions rather than an opaque httpx.HTTPStatusError.
+# ---------------------------------------------------------------------------
+
+VALID_QUAD = {"subject": "ex:s", "predicate": "ex:p", "object": '"v"'}
+
+
+@respx.mock
+async def test_shared_memory_write_maps_curator_unconfirmed(client):
+    respx.post(f"{BASE}/api/shared-memory/write").mock(
+        return_value=httpx.Response(
+            503,
+            json={
+                "error": "curator did not confirm",
+                "code": "CURATOR_UNCONFIRMED",
+                "curatorDelivery": "unconfirmed",
+                "contextGraphId": "cg-1",
+            },
+        )
+    )
+    with pytest.raises(CuratorUnconfirmedError) as exc:
+        await client.shared_memory_write(quads=[VALID_QUAD], context_graph_id="cg-1")
+    err = exc.value
+    assert isinstance(err, CuratorAckError)
+    assert err.code == "CURATOR_UNCONFIRMED"
+    assert err.curator_delivery == "unconfirmed"
+    assert err.context_graph_id == "cg-1"
+    assert err.response is not None and err.response.status_code == 503
+
+
+@respx.mock
+async def test_shared_memory_publish_maps_curator_rejected(client):
+    respx.post(f"{BASE}/api/shared-memory/publish").mock(
+        return_value=httpx.Response(
+            409,
+            json={"error": "curator rejected", "code": "CURATOR_REJECTED"},
+        )
+    )
+    with pytest.raises(CuratorRejectedError) as exc:
+        await client.shared_memory_publish(context_graph_id="cg-1")
+    assert exc.value.code == "CURATOR_REJECTED"
+
+
+@respx.mock
+async def test_assertion_promote_maps_curator_unconfirmed(client):
+    respx.post(f"{BASE}/api/assertion/a1/promote").mock(
+        return_value=httpx.Response(
+            503, json={"error": "no ack", "code": "CURATOR_UNCONFIRMED"}
+        )
+    )
+    with pytest.raises(CuratorUnconfirmedError):
+        await client.assertion_promote(name="a1", context_graph_id="cg-1")
+
+
+@respx.mock
+async def test_generic_503_without_code_stays_http_error(client):
+    # A 503 that is NOT a curator-ack failure must remain a plain HTTPStatusError,
+    # so we don't mislabel unrelated outages as curator rejections.
+    respx.post(f"{BASE}/api/shared-memory/write").mock(
+        return_value=httpx.Response(503, json={"error": "node overloaded"})
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.shared_memory_write(quads=[VALID_QUAD])

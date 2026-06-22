@@ -14,6 +14,80 @@ import httpx
 QuadLike = Mapping[str, str] | Sequence[str]
 
 
+class DKGError(Exception):
+    """Base class for errors raised by :class:`DKGClient`."""
+
+
+class CuratorAckError(DKGError):
+    """A SHARE/PUBLISH write was not accepted by the Context Graph curator.
+
+    The DKG v10 node's OT-RFC-49 curator-leader model gates writes to Shared
+    Working Memory on confirmation from the curator (the authoritative replica).
+    When that confirmation does not arrive (HTTP 503) or the curator rejects the
+    write (HTTP 409), the node returns a structured ``code`` instead of a generic
+    error; this exception surfaces it as an actionable, catchable failure.
+
+    Attributes:
+        code: The node's machine code (``CURATOR_UNCONFIRMED`` / ``CURATOR_REJECTED``).
+        curator_delivery: The node's ``curatorDelivery`` field, if present.
+        context_graph_id: The originating Context Graph id, if the node reported it.
+        response: The underlying ``httpx.Response``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        curator_delivery: str | None = None,
+        context_graph_id: str | None = None,
+        response: httpx.Response | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.curator_delivery = curator_delivery
+        self.context_graph_id = context_graph_id
+        self.response = response
+
+
+class CuratorUnconfirmedError(CuratorAckError):
+    """HTTP 503 ``CURATOR_UNCONFIRMED`` — the curator did not confirm; nothing was persisted."""
+
+
+class CuratorRejectedError(CuratorAckError):
+    """HTTP 409 ``CURATOR_REJECTED`` — the curator actively rejected the write."""
+
+
+def _raise_for_curator_ack(r: httpx.Response) -> None:
+    """Map the node's OT-RFC-49 curator-ack failures to typed exceptions.
+
+    The SHARE/PUBLISH write paths return ``503 CURATOR_UNCONFIRMED`` or
+    ``409 CURATOR_REJECTED`` (node rc.19+). Translate those into
+    :class:`CuratorUnconfirmedError` / :class:`CuratorRejectedError` so callers can
+    catch them precisely; any other status (including a generic 503/409 without the
+    curator ``code``) is left for the caller's ``raise_for_status()``.
+    """
+    if r.status_code not in (409, 503):
+        return
+    try:
+        body = r.json()
+    except Exception:
+        return
+    if not isinstance(body, dict):
+        return
+    code = body.get("code")
+    if code not in ("CURATOR_UNCONFIRMED", "CURATOR_REJECTED"):
+        return
+    exc_cls = CuratorUnconfirmedError if code == "CURATOR_UNCONFIRMED" else CuratorRejectedError
+    raise exc_cls(
+        body.get("error") or code,
+        code=code,
+        curator_delivery=body.get("curatorDelivery"),
+        context_graph_id=body.get("contextGraphId"),
+        response=r,
+    )
+
+
 def _normalize_quad(quad: QuadLike) -> dict[str, str]:
     """Normalize a quad into the node's ``{subject, predicate, object[, graph]}`` shape.
 
@@ -59,7 +133,9 @@ def _normalize_quad(quad: QuadLike) -> dict[str, str]:
 class DKGClient:
     """Thin async wrapper around the DKG v10 HTTP API (port 9200).
 
-    All methods raise httpx.HTTPStatusError on non-2xx responses.
+    Most methods raise httpx.HTTPStatusError on non-2xx responses. The SHARE/PUBLISH
+    write paths additionally raise CuratorUnconfirmedError / CuratorRejectedError
+    (subclasses of CuratorAckError) for the node's OT-RFC-49 curator-ack failures.
     """
 
     def __init__(
@@ -210,6 +286,7 @@ class DKGClient:
                 headers=self._headers,
                 json=body,
             )
+            _raise_for_curator_ack(r)
             r.raise_for_status()
             return r.json()
 
@@ -232,6 +309,7 @@ class DKGClient:
                 headers=self._headers,
                 json=body,
             )
+            _raise_for_curator_ack(r)
             r.raise_for_status()
             return r.json()
 
@@ -298,6 +376,7 @@ class DKGClient:
                 headers=self._headers,
                 json=body,
             )
+            _raise_for_curator_ack(r)
             r.raise_for_status()
             return r.json()
 
@@ -314,6 +393,7 @@ class DKGClient:
                 headers=self._headers,
                 json=body,
             )
+            _raise_for_curator_ack(r)
             r.raise_for_status()
             return r.json()
 
