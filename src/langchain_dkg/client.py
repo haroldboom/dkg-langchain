@@ -3,9 +3,57 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import httpx
+
+# A quad accepted by the write methods: either a mapping with
+# subject/predicate/object (and optional graph) keys, or a 3-/4-tuple in
+# (subject, predicate, object[, graph]) order.
+QuadLike = Mapping[str, str] | Sequence[str]
+
+
+def _normalize_quad(quad: QuadLike) -> dict[str, str]:
+    """Normalize a quad into the node's ``{subject, predicate, object[, graph]}`` shape.
+
+    The DKG v10 node's ``/api/shared-memory/write`` and ``/api/assertion/{name}/write``
+    endpoints require each quad to be an object with string ``subject``, ``predicate``,
+    and ``object`` terms (and an optional string ``graph``); since node rc.19 they
+    reject string-shaped quads with HTTP 400. Validate client-side so callers get a
+    clear error instead of an opaque 400.
+    """
+    if isinstance(quad, str):
+        raise ValueError(
+            "Quads must be structured, not raw strings. Pass a mapping "
+            '{"subject": ..., "predicate": ..., "object": ...} (optional "graph") '
+            "or a (subject, predicate, object[, graph]) tuple."
+        )
+    if isinstance(quad, Mapping):
+        subject, predicate, obj = quad.get("subject"), quad.get("predicate"), quad.get("object")
+        graph = quad.get("graph")
+    elif isinstance(quad, Sequence):
+        if len(quad) not in (3, 4):
+            raise ValueError(
+                "Quad tuple must have 3 or 4 elements "
+                f"(subject, predicate, object[, graph]); got {len(quad)}"
+            )
+        subject, predicate, obj = quad[0], quad[1], quad[2]
+        graph = quad[3] if len(quad) == 4 else None
+    else:
+        raise ValueError(
+            "Each quad must be a mapping with subject/predicate/object keys "
+            f"or a 3-/4-tuple; got {type(quad).__name__}"
+        )
+    for field, value in (("subject", subject), ("predicate", predicate), ("object", obj)):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f'Quad "{field}" must be a non-empty string; got {value!r}')
+    normalized = {"subject": subject, "predicate": predicate, "object": obj}
+    if graph is not None:
+        if not isinstance(graph, str):
+            raise ValueError(f'Quad "graph" must be a string; got {graph!r}')
+        normalized["graph"] = graph
+    return normalized
 
 
 class DKGClient:
@@ -142,10 +190,18 @@ class DKGClient:
         self,
         name: str,
         context_graph_id: str,
-        quads: list[str],
+        quads: list[QuadLike],
         sub_graph_name: str | None = None,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"contextGraphId": context_graph_id, "quads": quads}
+        """Write RDF quads into a named Working Memory assertion.
+
+        Quads follow the same shape as :meth:`shared_memory_write` — a mapping with
+        ``subject``/``predicate``/``object`` (optional ``graph``) keys, or a 3-/4-tuple.
+        """
+        body: dict[str, Any] = {
+            "contextGraphId": context_graph_id,
+            "quads": [_normalize_quad(q) for q in quads],
+        }
         if sub_graph_name:
             body["subGraphName"] = sub_graph_name
         async with httpx.AsyncClient(timeout=self._timeout) as http:
@@ -224,9 +280,16 @@ class DKGClient:
     # ------------------------------------------------------------------
 
     async def shared_memory_write(
-        self, triples: list[str], context_graph_id: str | None = None
+        self, quads: list[QuadLike], context_graph_id: str | None = None
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"triples": triples}
+        """Write loose RDF quads directly to Shared Working Memory.
+
+        Each quad may be a mapping with ``subject``/``predicate``/``object`` (and
+        optional ``graph``) keys, or a 3-/4-tuple in (subject, predicate,
+        object[, graph]) order. ``subject``/``predicate`` must be absolute IRIs and
+        ``object`` an absolute IRI or a quoted RDF literal (e.g. ``'"hello"'``).
+        """
+        body: dict[str, Any] = {"quads": [_normalize_quad(q) for q in quads]}
         if context_graph_id:
             body["contextGraphId"] = context_graph_id
         async with httpx.AsyncClient(timeout=self._timeout) as http:

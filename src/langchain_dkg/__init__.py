@@ -5,7 +5,7 @@ from .chat_history import DKGChatMessageHistory
 from .memory import DKGMemory
 from .retriever import DKGRetriever
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 __all__ = [
     "DKGClient",
     "DKGChatMessageHistory",

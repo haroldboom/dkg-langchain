@@ -125,3 +125,70 @@ async def test_assertion_promote(client):
     )
     result = await client.assertion_promote(name="my-assert", context_graph_id="cg-1")
     assert result["status"] == "shared"
+
+
+# ---------------------------------------------------------------------------
+# Quad-shaped writes (shared_memory_write / assertion_write)
+#
+# The node's /api/shared-memory/write and /api/assertion/{name}/write endpoints
+# require `quads` as an array of {subject, predicate, object[, graph]} objects;
+# since node rc.19 they 400 on string-shaped quads. These guard the wire shape.
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_shared_memory_write_sends_quads_objects(client):
+    respx.post(f"{BASE}/api/shared-memory/write").mock(
+        return_value=httpx.Response(200, json={"status": "written"})
+    )
+    await client.shared_memory_write(
+        quads=[{"subject": "ex:s", "predicate": "ex:p", "object": '"hello"'}],
+        context_graph_id="cg-1",
+    )
+    body = json.loads(respx.calls.last.request.content)
+    # Correct field name is "quads" (not the old broken "triples")...
+    assert "triples" not in body
+    assert body["contextGraphId"] == "cg-1"
+    # ...and each element is a structured object, not a bare string.
+    assert body["quads"] == [{"subject": "ex:s", "predicate": "ex:p", "object": '"hello"'}]
+
+
+@respx.mock
+async def test_shared_memory_write_normalizes_tuples(client):
+    respx.post(f"{BASE}/api/shared-memory/write").mock(
+        return_value=httpx.Response(200, json={"status": "written"})
+    )
+    await client.shared_memory_write(
+        quads=[("ex:s", "ex:p", "ex:o", "ex:g")],
+    )
+    body = json.loads(respx.calls.last.request.content)
+    assert body["quads"] == [
+        {"subject": "ex:s", "predicate": "ex:p", "object": "ex:o", "graph": "ex:g"}
+    ]
+
+
+async def test_shared_memory_write_rejects_raw_strings(client):
+    # Regression guard: the old API took list[str] and sent {"triples": [...]},
+    # which the node ignored (HTTP 400). Raw strings now fail fast, client-side.
+    with pytest.raises(ValueError, match="structured, not raw strings"):
+        await client.shared_memory_write(quads=["<ex:s> <ex:p> <ex:o> ."])
+
+
+async def test_shared_memory_write_rejects_short_tuple(client):
+    with pytest.raises(ValueError, match="3 or 4 elements"):
+        await client.shared_memory_write(quads=[("ex:s", "ex:p")])
+
+
+@respx.mock
+async def test_assertion_write_sends_quads_objects(client):
+    respx.post(f"{BASE}/api/assertion/my-assert/write").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
+    )
+    await client.assertion_write(
+        name="my-assert",
+        context_graph_id="cg-1",
+        quads=[("ex:s", "ex:p", '"v"')],
+    )
+    body = json.loads(respx.calls.last.request.content)
+    assert body["contextGraphId"] == "cg-1"
+    assert body["quads"] == [{"subject": "ex:s", "predicate": "ex:p", "object": '"v"'}]
