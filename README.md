@@ -9,6 +9,11 @@ LangChain memory and retriever backed by [OriginTrail DKG v10](https://origintra
 
 Give any LangChain agent persistent, verifiable, queryable memory — every conversation turn stored as a cryptographically-linked Knowledge Asset on the Decentralized Knowledge Graph.
 
+## Demo
+
+- **Walkthrough video:** [youtu.be/7VEjDqflEpc](https://youtu.be/7VEjDqflEpc) — narrated run of all three components against a live DKG v10 node.
+- **Recording script:** [`examples/demo_video.py`](examples/demo_video.py) — the script behind the video.
+
 ## Install
 
 ```bash
