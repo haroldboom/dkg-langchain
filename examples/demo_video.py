@@ -15,6 +15,11 @@ Usage:
 import asyncio
 import os
 import time
+import warnings
+
+# LangChain re-enables its deprecation warnings via simplefilter("always"),
+# so a filter can't keep the recording clean — drop them at the sink.
+warnings.showwarning = lambda *args, **kwargs: None
 
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_dkg import DKGChatMessageHistory, DKGMemory, DKGRetriever, DKGClient
@@ -159,7 +164,11 @@ async def demo_memory_chain(client: DKGClient) -> None:
             config={"configurable": {"session_id": "demo-session-01"}},
         )
         answer = response.content if hasattr(response, "content") else str(response)
-        print(f"  AI:    {answer}")
+        import textwrap
+        print(textwrap.fill(
+            answer, width=100,
+            initial_indent="  AI:    ", subsequent_indent="         ",
+        ))
         print()
         pause(1.5)
 
@@ -201,8 +210,8 @@ async def demo_retriever(client: DKGClient) -> None:
 async def main() -> None:
     w = 62
     print("\n╔" + "═" * w + "╗")
-    print("║  langchain-dkg  —  LangChain × OriginTrail DKG v10        ║")
-    print("║  Bounty tag: cfi-dkgv10-r1   |   pip install langchain-dkg║")
+    print("║  langchain-dkg  —  LangChain × OriginTrail DKG v10           ║")
+    print("║  Bounty tag: cfi-dkgv10-r1   |   pip install langchain-dkg   ║")
     print("╚" + "═" * w + "╝\n")
 
     if not TOKEN:
