@@ -335,11 +335,14 @@ class DKGClient:
         paranet_id: str | None = None,
         graph_suffix: str | None = None,
         include_workspace: bool = True,
+        context_graph_id: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "sparql": sparql,
             "includeWorkspace": include_workspace,
         }
+        if context_graph_id:
+            body["contextGraphId"] = context_graph_id
         if paranet_id:
             body["paranetId"] = paranet_id
         if graph_suffix:

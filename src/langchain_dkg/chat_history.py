@@ -50,6 +50,9 @@ class DKGChatMessageHistory(BaseChatMessageHistory):
         sub_graph_name: Optional sub-graph within the Context Graph.
         layer: Memory layer — "wm" (Working Memory, private) or "swm"
             (Shared Working Memory, gossiped). Defaults to "swm".
+        search_layers: Memory layers searched by get_messages. Defaults to
+            ["wm", "swm"] — newer node builds return nothing when the request
+            omits memoryLayers, so the layers are always sent explicitly.
     """
 
     def __init__(
@@ -61,6 +64,7 @@ class DKGChatMessageHistory(BaseChatMessageHistory):
         session_uri: str | None = None,
         sub_graph_name: str | None = None,
         layer: str | None = None,
+        search_layers: list[str] | None = None,
     ) -> None:
         self.context_graph_id = context_graph_id
         self.client = client or DKGClient()
@@ -69,6 +73,7 @@ class DKGChatMessageHistory(BaseChatMessageHistory):
         self.session_uri = session_uri
         self.sub_graph_name = sub_graph_name
         self.layer = layer
+        self.search_layers = search_layers or ["wm", "swm"]
         # Maps markdown content -> turnUri for subsequent promote_to_shared calls
         self._turn_uri_index: dict[str, str] = {}
 
@@ -86,6 +91,7 @@ class DKGChatMessageHistory(BaseChatMessageHistory):
             context_graph_id=self.context_graph_id,
             query=self.search_query,
             limit=self.search_limit,
+            memory_layers=self.search_layers,
         )
         messages: list[BaseMessage] = []
         for item in result.get("results", []):

@@ -46,6 +46,9 @@ class DKGMemory:
         context_graph_id: DKG Context Graph scoping this memory.
         client: Pre-configured DKGClient (built from env vars if omitted).
         search_limit: Max turns to retrieve per chain call.
+        search_query: Seed query used to retrieve relevant history turns.
+            Defaults to "conversation history"; set it to the session's topic
+            for sharper semantic retrieval.
         sub_graph_name: Optional sub-graph name within the Context Graph.
         layer: Memory layer for stored turns — "wm" (Working Memory, private)
             or "swm" (Shared Working Memory, gossiped). Defaults to the node's
@@ -57,12 +60,14 @@ class DKGMemory:
         context_graph_id: str,
         client: DKGClient | None = None,
         search_limit: int = 10,
+        search_query: str = "conversation history",
         sub_graph_name: str | None = None,
         layer: str | None = None,
     ) -> None:
         self.context_graph_id = context_graph_id
         self.client = client or DKGClient()
         self.search_limit = search_limit
+        self.search_query = search_query
         self.sub_graph_name = sub_graph_name
         self.layer = layer
 
@@ -75,7 +80,7 @@ class DKGMemory:
         return DKGChatMessageHistory(
             context_graph_id=self.context_graph_id,
             client=self.client,
-            search_query="conversation history",
+            search_query=self.search_query,
             search_limit=self.search_limit,
             session_uri=f"urn:session:{session_id}",
             sub_graph_name=self.sub_graph_name,

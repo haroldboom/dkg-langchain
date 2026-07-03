@@ -64,6 +64,7 @@ class DKGRetriever(BaseRetriever):
     paranet_id: str | None = None
     graph_suffix: str | None = None
     include_workspace: bool = True
+    context_graph_id: str | None = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -98,11 +99,23 @@ class DKGRetriever(BaseRetriever):
             paranet_id=self.paranet_id,
             graph_suffix=self.graph_suffix,
             include_workspace=self.include_workspace,
+            context_graph_id=self.context_graph_id,
         )
         docs: list[Document] = []
-        bindings = result.get("results", {}).get("bindings", [])
+        # Node builds < rc.19 return SPARQL-standard {"results": {"bindings"}};
+        # newer builds return {"result": {"bindings"}}.
+        bindings = (
+            result.get("results", {}).get("bindings")
+            or result.get("result", {}).get("bindings")
+            or []
+        )
         for binding in bindings:
-            values = {var: cell.get("value", "") for var, cell in binding.items()}
+            # SPARQL-standard cells are {"type": ..., "value": ...}; newer
+            # node builds bind plain string values instead.
+            values = {
+                var: cell.get("value", "") if isinstance(cell, dict) else str(cell)
+                for var, cell in binding.items()
+            }
             subject = values.get("subject", "")
             predicate = values.get("predicate", "")
             obj = values.get("object", "")
@@ -133,4 +146,5 @@ class DKGRetriever(BaseRetriever):
             paranet_id=self.paranet_id,
             graph_suffix=self.graph_suffix,
             include_workspace=self.include_workspace,
+            context_graph_id=self.context_graph_id,
         )

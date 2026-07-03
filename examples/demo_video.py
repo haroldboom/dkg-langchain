@@ -21,7 +21,7 @@ from langchain_dkg import DKGChatMessageHistory, DKGMemory, DKGRetriever, DKGCli
 
 TOKEN = os.environ.get("DKG_TOKEN", "")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
-CONTEXT_GRAPH = "langchain-dkg-demo"
+CONTEXT_GRAPH = os.environ.get("DKG_CONTEXT_GRAPH", "langchain-dkg-demo")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -111,8 +111,9 @@ async def demo_memory_chain(client: DKGClient) -> None:
 
     if OPENAI_KEY:
         from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        llm_label = "gpt-4o-mini"
+        model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        llm = ChatOpenAI(model=model_name, temperature=0)
+        llm_label = model_name
     else:
         from langchain_core.language_models.fake_chat_models import FakeListChatModel
         llm = FakeListChatModel(responses=[
@@ -130,7 +131,7 @@ async def demo_memory_chain(client: DKGClient) -> None:
     pause(0.8)
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful assistant with access to a Decentralized Knowledge Graph."),
+        ("system", "You are a helpful assistant with access to a Decentralized Knowledge Graph. Answer in at most three short sentences."),
         MessagesPlaceholder(variable_name="history"),
         ("human", "{input}"),
     ])
@@ -140,6 +141,7 @@ async def demo_memory_chain(client: DKGClient) -> None:
         context_graph_id=CONTEXT_GRAPH,
         client=client,
         search_limit=4,
+        search_query="DKG v10 memory layers",
         history_messages_key="history",
     )
     ok("Chain assembled: ChatPromptTemplate | LLM | DKGMemory\n")
@@ -173,9 +175,14 @@ async def demo_retriever(client: DKGClient) -> None:
     print("  Query the Knowledge Graph — results returned as LangChain Documents.\n")
     pause()
 
-    retriever = DKGRetriever(client=client, limit=6, include_workspace=True)
+    retriever = DKGRetriever(
+        client=client,
+        limit=6,
+        include_workspace=True,
+        context_graph_id=CONTEXT_GRAPH,
+    )
 
-    for query in ["DKG", "Testnet"]:
+    for query in ["Working Memory", "graph"]:
         step(f"Query: \"{query}\"")
         pause(0.4)
         docs = await retriever.ainvoke(query)
