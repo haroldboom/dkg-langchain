@@ -131,8 +131,8 @@ async def demo_memory_chain(client: DKGClient) -> None:
         llm_label = "FakeListChatModel (set OPENAI_API_KEY for a real LLM)"
 
     info(f"LLM             : {llm_label}")
-    info(f"Memory backend  : DKG v10 Working Memory  ({CONTEXT_GRAPH})")
-    info(f"Session ID      : demo-session-01\n")
+    info(f"Memory backend  : DKG v10 Shared Working Memory  ({CONTEXT_GRAPH})")
+    info("Session ID      : demo-session-01\n")
     pause(0.8)
 
     prompt = ChatPromptTemplate.from_messages([
@@ -141,6 +141,9 @@ async def demo_memory_chain(client: DKGClient) -> None:
         ("human", "{input}"),
     ])
 
+    # layer="swm" so Demo 3's SPARQL retriever can see these turns: current
+    # node builds do not expose wm-layer quads via /api/query (the RFC-29
+    # working-memory isolation gate is fail-closed), only shared memory.
     chain_with_memory = DKGMemory.wrap_chain(
         prompt | llm,
         context_graph_id=CONTEXT_GRAPH,
@@ -148,6 +151,7 @@ async def demo_memory_chain(client: DKGClient) -> None:
         search_limit=4,
         search_query="DKG v10 memory layers",
         history_messages_key="history",
+        layer="swm",
     )
     ok("Chain assembled: ChatPromptTemplate | LLM | DKGMemory\n")
     pause(0.5)

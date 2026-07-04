@@ -96,7 +96,11 @@ DKG v10 has three memory layers:
 | Shared Working Memory (`swm`) | Gossip-replicated | Free | Team-visible context |
 | Verified Memory | On-chain, permanent | TRAC | Auditable, publishable knowledge |
 
-By default, turns are written to Shared Working Memory (`swm`). Use `layer="wm"` for private-only storage.
+> **Breaking behavior change (0.1.9):** turns are now written to private
+> Working Memory (`layer="wm"`) by default. Earlier versions deferred to the
+> node's default, which is Shared Working Memory (`swm`, gossiped to peers).
+> Pass `layer="swm"` to keep the old gossiped behavior, or `layer=None` to use
+> the node's default.
 
 Explicit promotion to Shared Memory:
 
@@ -104,6 +108,30 @@ Explicit promotion to Shared Memory:
 turn_uri = history.get_turn_uri("**Human:** Summarize this meeting")
 await history.promote_to_shared(turn_uri)
 ```
+
+Promotion is asynchronous on current node builds: `DKGClient.assertion_promote`
+submits a job via `POST /api/assertion/{name}/promote-async`, then polls
+`GET /api/assertion/promote-async/{jobId}` (about once per second, up to
+`poll_timeout=30.0` seconds) and returns the final job view. A failed job
+raises `CuratorUnconfirmedError` / `CuratorRejectedError` when the curator did
+not confirm or rejected the write, and `DKGError` otherwise (including poll
+timeouts). Note: current node builds expose promotion for named Working Memory
+assertions; promoting memory *turns* by URI may not be supported.
+
+## Retrieval options
+
+History retrieval is **semantic-relevance based** — `history.messages` runs a
+tri-modal search seeded by `search_query`, not a chronological dump.
+
+- `search_query` (`DKGChatMessageHistory`, `DKGMemory`): seed query used to
+  retrieve relevant past turns. Defaults to `"conversation history"`; set it
+  to the session's topic for sharper retrieval.
+- `search_layers` (`DKGChatMessageHistory`): memory layers searched, default
+  `["wm", "swm"]`. Current node builds return nothing when `memoryLayers` is
+  omitted, so the layers are always sent explicitly.
+- `context_graph_id` (`DKGRetriever`): scopes SPARQL queries to a Context
+  Graph — required by current node builds to see workspace (Working Memory)
+  data.
 
 ## Configuration
 
@@ -117,6 +145,40 @@ Or pass `token=` / `base_url=` directly to `DKGClient`.
 ## Session isolation
 
 Each `session_id` passed to `chain_with_memory.invoke(config={"configurable": {"session_id": "..."}})` becomes a `sessionUri` in DKG, linking turns together within the shared Context Graph.
+
+When `session_uri` is set on `DKGChatMessageHistory`, retrieval applies a
+client-side session filter: the node's search API has no session parameter, so
+the history over-fetches, looks up the session's turns via SPARQL
+(`<session_uri> <http://schema.org/hasPart> ?turn`), keeps only those turns
+and sorts them chronologically. If the lookup fails or the session has no
+linked turns, unfiltered search results are returned.
+
+## Node compatibility
+
+DKG v10 nodes auto-update, and pre-release API surfaces drift (e.g. the
+synchronous promote route was replaced by `promote-async`, `memory/search`
+began requiring `memoryLayers`, and `/api/query` changed its result shape).
+This version was verified against node build `10.0.2` (July 2026). If you see
+unexpected 404s/400s or empty results after a node update, check for a newer
+`langchain-dkg` release.
+
+Known limitations of node `10.0.2`:
+
+- **`/api/query` cannot see Working Memory (`wm`) quads.** The RFC-29
+  working-memory isolation gate is fail-closed and the signature plumbing is
+  not shipped in this build, so SPARQL queries (including `DKGRetriever`)
+  only cover Shared Working Memory and published data —
+  `include_workspace=True` maps to the node's `includeSharedMemory`. Use
+  `history.messages` / `memory_search` (which does return `wm` results) to
+  retrieve private turns, or write turns with `layer="swm"` when they must be
+  SPARQL-queryable.
+- The legacy `/api/assertion/create` and promote routes moved to the
+  `/api/knowledge-assets` surface; this client targets the new routes and
+  falls back to the legacy ones on 404. `assertion_write` /
+  `assertion_history` / `shared_memory_publish` still target legacy routes
+  that 404 on `10.0.2` (the new equivalents are
+  `/api/knowledge-assets/{name}/wm/write` and the publish surface); they will
+  be ported in a future release.
 
 ## Development
 

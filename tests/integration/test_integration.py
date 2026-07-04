@@ -31,9 +31,15 @@ def client():
 
 
 @pytest.fixture
-def unique_context(client):
-    """Each test gets its own Context Graph to avoid cross-test pollution."""
-    return f"integration-test-{uuid.uuid4().hex[:8]}"
+async def unique_context(client):
+    """Each test gets its own Context Graph to avoid cross-test pollution.
+
+    Current node builds reject writes to a context graph that does not
+    exist, so the graph is created up front.
+    """
+    cg = f"integration-test-{uuid.uuid4().hex[:8]}"
+    await client.create_context_graph(cg)
+    return cg
 
 
 async def test_node_reachable(client):
@@ -60,7 +66,7 @@ async def test_ual_returned_on_store(client, unique_context):
         client=client,
     )
     await history.aadd_message(HumanMessage(content="UAL test message"))
-    ual = history.get_ual("human", "UAL test message")
+    ual = history.get_turn_uri("**Human:** UAL test message")
     assert ual is not None, "Expected a UAL to be returned and stored"
     assert "dkg" in ual.lower() or ":" in ual, f"UAL looks malformed: {ual}"
 
@@ -68,5 +74,5 @@ async def test_ual_returned_on_store(client, unique_context):
 async def test_sparql_query(client, unique_context):
     retriever = DKGRetriever(client=client, limit=5, include_workspace=True)
     # A broad query that should return at least empty results without error
-    docs = await retriever._aget_relevant_documents("knowledge")
+    docs = await retriever.ainvoke("knowledge")
     assert isinstance(docs, list)

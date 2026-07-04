@@ -78,7 +78,7 @@ async def run_demo():
     print("\n=== Demo 2: DKGRetriever (SPARQL) ===")
     retriever = DKGRetriever(client=client, limit=10, include_workspace=True)
     print("Querying DKG for 'OriginTrail'...")
-    docs = await retriever._aget_relevant_documents("OriginTrail")
+    docs = await retriever.ainvoke("OriginTrail")
     print(f"  Retrieved {len(docs)} triples as Documents")
     for doc in docs[:3]:
         print(f"    {doc.page_content[:100]}")

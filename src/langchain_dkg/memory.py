@@ -30,7 +30,7 @@ Usage::
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 from langchain_core.runnables import Runnable
 from langchain_core.runnables.history import RunnableWithMessageHistory
@@ -51,8 +51,10 @@ class DKGMemory:
             for sharper semantic retrieval.
         sub_graph_name: Optional sub-graph name within the Context Graph.
         layer: Memory layer for stored turns — "wm" (Working Memory, private)
-            or "swm" (Shared Working Memory, gossiped). Defaults to the node's
-            default ("swm") when omitted.
+            or "swm" (Shared Working Memory, gossiped). Defaults to "wm" so
+            conversation history stays private by default; pass ``layer="swm"``
+            to gossip turns, or ``layer=None`` for the node's default
+            (currently "swm").
     """
 
     def __init__(
@@ -62,7 +64,7 @@ class DKGMemory:
         search_limit: int = 10,
         search_query: str = "conversation history",
         sub_graph_name: str | None = None,
-        layer: str | None = None,
+        layer: str | None = "wm",
     ) -> None:
         self.context_graph_id = context_graph_id
         self.client = client or DKGClient()

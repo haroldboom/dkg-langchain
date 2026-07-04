@@ -5,19 +5,23 @@ from .client import (
     CuratorRejectedError,
     CuratorUnconfirmedError,
     DKGClient,
+    DKGConnectionError,
     DKGError,
+    DKGStatusError,
 )
 from .chat_history import DKGChatMessageHistory
 from .memory import DKGMemory
 from .retriever import DKGRetriever
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 __all__ = [
     "DKGClient",
     "DKGChatMessageHistory",
     "DKGMemory",
     "DKGRetriever",
     "DKGError",
+    "DKGConnectionError",
+    "DKGStatusError",
     "CuratorAckError",
     "CuratorUnconfirmedError",
     "CuratorRejectedError",

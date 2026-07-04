@@ -1,8 +1,6 @@
 """Unit tests for DKGMemory."""
 
 import pytest
-import respx
-import httpx
 
 from langchain_core.runnables import RunnableWithMessageHistory
 from langchain_dkg.client import DKGClient
@@ -56,3 +54,23 @@ def test_search_limit_propagated(client):
     mem = DKGMemory(context_graph_id="cg", client=client, search_limit=3)
     hist = mem.get_history("s1")
     assert hist.search_limit == 3
+
+
+def test_search_query_propagated(client):
+    mem = DKGMemory(context_graph_id="cg", client=client, search_query="wheat harvest plans")
+    hist = mem.get_history("s1")
+    assert hist.search_query == "wheat harvest plans"
+
+
+def test_layer_defaults_to_wm(client):
+    # Private-by-default: history turns go to Working Memory unless overridden.
+    mem = DKGMemory(context_graph_id="cg", client=client)
+    assert mem.layer == "wm"
+    hist = mem.get_history("s1")
+    assert hist.layer == "wm"
+
+
+def test_layer_override_propagated(client):
+    mem = DKGMemory(context_graph_id="cg", client=client, layer="swm")
+    hist = mem.get_history("s1")
+    assert hist.layer == "swm"

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -13,9 +16,30 @@ import httpx
 # (subject, predicate, object[, graph]) order.
 QuadLike = Mapping[str, str] | Sequence[str]
 
+# Excerpt length for response bodies stored on exceptions.
+_BODY_EXCERPT_LEN = 1000
+
 
 class DKGError(Exception):
     """Base class for errors raised by :class:`DKGClient`."""
+
+
+class DKGConnectionError(DKGError):
+    """The DKG node could not be reached (transport failure or timeout)."""
+
+
+class DKGStatusError(DKGError):
+    """The DKG node returned a non-2xx HTTP status.
+
+    Attributes:
+        status_code: The HTTP status code.
+        body: An excerpt of the response body (may be empty).
+    """
+
+    def __init__(self, message: str, *, status_code: int, body: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body[:_BODY_EXCERPT_LEN]
 
 
 class CuratorAckError(DKGError):
@@ -31,7 +55,8 @@ class CuratorAckError(DKGError):
         code: The node's machine code (``CURATOR_UNCONFIRMED`` / ``CURATOR_REJECTED``).
         curator_delivery: The node's ``curatorDelivery`` field, if present.
         context_graph_id: The originating Context Graph id, if the node reported it.
-        response: The underlying ``httpx.Response``.
+        status_code: The HTTP status code, if the failure came from an HTTP response.
+        body: The parsed response body (or job view), if available.
     """
 
     def __init__(
@@ -41,13 +66,15 @@ class CuratorAckError(DKGError):
         code: str,
         curator_delivery: str | None = None,
         context_graph_id: str | None = None,
-        response: httpx.Response | None = None,
+        status_code: int | None = None,
+        body: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.curator_delivery = curator_delivery
         self.context_graph_id = context_graph_id
-        self.response = response
+        self.status_code = status_code
+        self.body = body
 
 
 class CuratorUnconfirmedError(CuratorAckError):
@@ -65,7 +92,7 @@ def _raise_for_curator_ack(r: httpx.Response) -> None:
     ``409 CURATOR_REJECTED`` (node rc.19+). Translate those into
     :class:`CuratorUnconfirmedError` / :class:`CuratorRejectedError` so callers can
     catch them precisely; any other status (including a generic 503/409 without the
-    curator ``code``) is left for the caller's ``raise_for_status()``.
+    curator ``code``) is left for the caller's status handling.
     """
     if r.status_code not in (409, 503):
         return
@@ -84,7 +111,8 @@ def _raise_for_curator_ack(r: httpx.Response) -> None:
         code=code,
         curator_delivery=body.get("curatorDelivery"),
         context_graph_id=body.get("contextGraphId"),
-        response=r,
+        status_code=r.status_code,
+        body=body,
     )
 
 
@@ -122,6 +150,7 @@ def _normalize_quad(quad: QuadLike) -> dict[str, str]:
     for field, value in (("subject", subject), ("predicate", predicate), ("object", obj)):
         if not isinstance(value, str) or not value:
             raise ValueError(f'Quad "{field}" must be a non-empty string; got {value!r}')
+    assert isinstance(subject, str) and isinstance(predicate, str) and isinstance(obj, str)
     normalized = {"subject": subject, "predicate": predicate, "object": obj}
     if graph is not None:
         if not isinstance(graph, str):
@@ -130,12 +159,33 @@ def _normalize_quad(quad: QuadLike) -> dict[str, str]:
     return normalized
 
 
+def _job_error_text(job: dict[str, Any]) -> str:
+    """Collect human/machine error fields from an async promote job view."""
+    parts: list[str] = []
+    for key in ("code", "error", "reason"):
+        value = job.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    for last_error in (job.get("lastError"), (job.get("attempt") or {}).get("lastError")):
+        if isinstance(last_error, dict):
+            for key in ("code", "message"):
+                value = last_error.get(key)
+                if isinstance(value, str) and value and value not in parts:
+                    parts.append(value)
+    return " | ".join(parts)
+
+
 class DKGClient:
     """Thin async wrapper around the DKG v10 HTTP API (port 9200).
 
-    Most methods raise httpx.HTTPStatusError on non-2xx responses. The SHARE/PUBLISH
-    write paths additionally raise CuratorUnconfirmedError / CuratorRejectedError
-    (subclasses of CuratorAckError) for the node's OT-RFC-49 curator-ack failures.
+    Methods raise :class:`DKGStatusError` on non-2xx responses and
+    :class:`DKGConnectionError` when the node cannot be reached. The
+    SHARE/PUBLISH write paths additionally raise CuratorUnconfirmedError /
+    CuratorRejectedError (subclasses of CuratorAckError) for the node's
+    OT-RFC-49 curator-ack failures.
+
+    The client keeps a pooled ``httpx.AsyncClient`` per event loop. Call
+    :meth:`aclose` (or use ``async with``) to release the pool explicitly.
     """
 
     def __init__(
@@ -152,20 +202,98 @@ class DKGClient:
             )
         self._headers = {"Authorization": f"Bearer {token}"}
         self._timeout = timeout
+        self._http: httpx.AsyncClient | None = None
+        self._http_loop: asyncio.AbstractEventLoop | None = None
+
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def _get_http(self) -> httpx.AsyncClient:
+        """Return a pooled AsyncClient bound to the current event loop.
+
+        If the running loop changed since the client was created (e.g. the
+        sync wrappers spawn a fresh loop per call), a new client is created;
+        the old one is abandoned rather than closed, because closing it from
+        a different loop is unsafe.
+        """
+        loop = asyncio.get_running_loop()
+        if self._http is None or self._http_loop is not loop:
+            self._http = httpx.AsyncClient(timeout=self._timeout)
+            self._http_loop = loop
+        return self._http
+
+    async def aclose(self) -> None:
+        """Close the pooled HTTP client, if it belongs to the current loop."""
+        http, self._http, loop, self._http_loop = self._http, None, self._http_loop, None
+        if http is not None and loop is asyncio.get_running_loop():
+            await http.aclose()
+
+    async def __aenter__(self) -> "DKGClient":
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        await self.aclose()
+
+    # ------------------------------------------------------------------
+    # Request plumbing
+    # ------------------------------------------------------------------
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        curator_ack: bool = False,
+    ) -> dict[str, Any]:
+        """Issue one HTTP request; map transport/status failures to DKG errors."""
+        http = self._get_http()
+        try:
+            r = await http.request(
+                method,
+                f"{self.base_url}{path}",
+                headers=self._headers,
+                json=json_body,
+                params=params,
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            raise DKGConnectionError(
+                f"Could not reach DKG node at {self.base_url}: {e!r}"
+            ) from e
+        # The curator-ack mapping must run first so 409/503 curator failures
+        # surface as CuratorRejectedError/CuratorUnconfirmedError, not a
+        # generic status error.
+        if curator_ack:
+            _raise_for_curator_ack(r)
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise DKGStatusError(
+                f"DKG node returned HTTP {r.status_code} for {method} {path}: "
+                f"{r.text[:_BODY_EXCERPT_LEN]}",
+                status_code=r.status_code,
+                body=r.text,
+            ) from e
+        return r.json()
 
     # ------------------------------------------------------------------
     # Context Graphs
     # ------------------------------------------------------------------
 
-    async def create_context_graph(self, name: str) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            r = await http.post(
-                f"{self.base_url}/api/context-graph/create",
-                headers=self._headers,
-                json={"name": name},
-            )
-            r.raise_for_status()
-            return r.json()
+    async def create_context_graph(self, name: str, id: str | None = None) -> dict[str, Any]:
+        """Create a Context Graph.
+
+        The node requires both ``id`` and ``name``; when ``id`` is omitted the
+        ``name`` is reused as the id. Returns the node response as-is
+        (``{"created": <id>, "uri": <uri>}`` on current builds).
+        """
+        return await self._request(
+            "POST",
+            "/api/context-graph/create",
+            json_body={"id": id or name, "name": name},
+        )
 
     # ------------------------------------------------------------------
     # Working Memory — conversation turns
@@ -186,7 +314,8 @@ class DKGClient:
             markdown: The turn content as Markdown text.
             session_uri: Optional IRI linking related turns into a session.
             layer: Target layer — "wm" for Working Memory (private), "swm" for
-                Shared Working Memory (gossiped). Defaults to "swm".
+                Shared Working Memory (gossiped). When None, the node default
+                applies ("swm" on current builds).
             sub_graph_name: Optional sub-graph within the Context Graph.
 
         Returns dict with keys: turnUri, fileHash, layer, graph,
@@ -202,14 +331,7 @@ class DKGClient:
             body["layer"] = layer
         if sub_graph_name:
             body["subGraphName"] = sub_graph_name
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            r = await http.post(
-                f"{self.base_url}/api/memory/turn",
-                headers=self._headers,
-                json=body,
-            )
-            r.raise_for_status()
-            return r.json()
+        return await self._request("POST", "/api/memory/turn", json_body=body)
 
     async def memory_search(
         self,
@@ -220,6 +342,14 @@ class DKGClient:
     ) -> dict[str, Any]:
         """Tri-modal search across vector, SPARQL, and text stores.
 
+        Args:
+            context_graph_id: Context Graph to search.
+            query: Free-text search query.
+            limit: Maximum number of results.
+            memory_layers: Layers to search. Defaults to ``["wm", "swm"]`` when
+                None — current node builds return 0 results when the request
+                omits ``memoryLayers``, so the layers are always sent.
+
         Returns dict with keys: query, contextGraphId, resultCount, results.
         Each result has: entityUri, label, sources, similarity, sourceFile,
             snippet, memoryLayer.
@@ -228,17 +358,9 @@ class DKGClient:
             "contextGraphId": context_graph_id,
             "query": query,
             "limit": limit,
+            "memoryLayers": memory_layers if memory_layers is not None else ["wm", "swm"],
         }
-        if memory_layers:
-            body["memoryLayers"] = memory_layers
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            r = await http.post(
-                f"{self.base_url}/api/memory/search",
-                headers=self._headers,
-                json=body,
-            )
-            r.raise_for_status()
-            return r.json()
+        return await self._request("POST", "/api/memory/search", json_body=body)
 
     # ------------------------------------------------------------------
     # Assertions (Working Memory)
@@ -250,17 +372,21 @@ class DKGClient:
         name: str,
         sub_graph_name: str | None = None,
     ) -> dict[str, Any]:
+        """Create a named Working Memory assertion (Knowledge Asset).
+
+        Current node builds serve this as ``POST /api/knowledge-assets``; the
+        legacy ``POST /api/assertion/create`` route is used as a fallback for
+        older builds. The response shape follows whichever route answered.
+        """
         body: dict[str, Any] = {"contextGraphId": context_graph_id, "name": name}
         if sub_graph_name:
             body["subGraphName"] = sub_graph_name
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            r = await http.post(
-                f"{self.base_url}/api/assertion/create",
-                headers=self._headers,
-                json=body,
-            )
-            r.raise_for_status()
-            return r.json()
+        try:
+            return await self._request("POST", "/api/knowledge-assets", json_body=body)
+        except DKGStatusError as e:
+            if e.status_code != 404:
+                raise
+            return await self._request("POST", "/api/assertion/create", json_body=body)
 
     async def assertion_write(
         self,
@@ -280,15 +406,12 @@ class DKGClient:
         }
         if sub_graph_name:
             body["subGraphName"] = sub_graph_name
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            r = await http.post(
-                f"{self.base_url}/api/assertion/{name}/write",
-                headers=self._headers,
-                json=body,
-            )
-            _raise_for_curator_ack(r)
-            r.raise_for_status()
-            return r.json()
+        return await self._request(
+            "POST",
+            f"/api/assertion/{urllib.parse.quote(name, safe='')}/write",
+            json_body=body,
+            curator_ack=True,
+        )
 
     async def assertion_promote(
         self,
@@ -296,34 +419,124 @@ class DKGClient:
         context_graph_id: str,
         entities: list[str] | None = None,
         sub_graph_name: str | None = None,
+        poll_timeout: float = 30.0,
+        poll_interval: float = 1.0,
     ) -> dict[str, Any]:
-        """Promote a Working Memory assertion to Shared Working Memory (SHARE)."""
+        """Promote a Working Memory assertion to Shared Working Memory (SHARE).
+
+        Current node builds only expose an asynchronous promote: the job is
+        submitted via ``POST /api/knowledge-assets/{name}/swm/share-async``
+        and polled via ``GET /api/knowledge-assets/swm/share-jobs/{jobId}``
+        until it reaches a terminal state (``succeeded`` / ``failed``). Older
+        builds that 404 the knowledge-assets surface fall back to the legacy
+        ``/api/assertion/{name}/promote-async`` routes.
+
+        Args:
+            name: Assertion name (URL-quoted automatically).
+            context_graph_id: Context Graph that owns the assertion.
+            entities: Optional subset of entities to promote.
+            sub_graph_name: Optional sub-graph within the Context Graph.
+            poll_timeout: Max seconds to wait for the job to finish.
+            poll_interval: Seconds between job-status polls.
+
+        Returns:
+            The final job view (``state == "succeeded"``).
+
+        Raises:
+            CuratorUnconfirmedError / CuratorRejectedError: when the job (or
+                the submission itself) fails with a curator-ack code.
+            DKGError: when the job fails otherwise or polling times out.
+        """
         body: dict[str, Any] = {"contextGraphId": context_graph_id}
         if entities:
             body["entities"] = entities
         if sub_graph_name:
             body["subGraphName"] = sub_graph_name
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            r = await http.post(
-                f"{self.base_url}/api/assertion/{name}/promote",
-                headers=self._headers,
-                json=body,
-            )
-            _raise_for_curator_ack(r)
-            r.raise_for_status()
-            return r.json()
+        quoted = urllib.parse.quote(name, safe="")
+        legacy = False
+        try:
+            try:
+                submitted = await self._request(
+                    "POST",
+                    f"/api/knowledge-assets/{quoted}/swm/share-async",
+                    json_body=body,
+                    curator_ack=True,
+                )
+            except DKGStatusError as e:
+                if e.status_code != 404:
+                    raise
+                # Older builds don't serve the knowledge-assets surface.
+                legacy = True
+                submitted = await self._request(
+                    "POST",
+                    f"/api/assertion/{quoted}/promote-async",
+                    json_body=body,
+                    curator_ack=True,
+                )
+        except DKGStatusError as e:
+            # 409 conflict: another job is already active for this assertion —
+            # poll the existing job instead of failing.
+            existing_job_id = None
+            if e.status_code == 409:
+                try:
+                    existing_job_id = json.loads(e.body).get("existingJobId")
+                except Exception:
+                    existing_job_id = None
+            if not existing_job_id:
+                raise
+            submitted = {"jobId": existing_job_id, "state": "queued"}
+        job_id = submitted.get("jobId")
+        if not job_id:
+            raise DKGError(f"Promote submission returned no jobId: {submitted!r}")
+
+        quoted_job = urllib.parse.quote(str(job_id), safe="")
+        poll_path = (
+            f"/api/assertion/promote-async/{quoted_job}"
+            if legacy
+            else f"/api/knowledge-assets/swm/share-jobs/{quoted_job}"
+        )
+        deadline = asyncio.get_running_loop().time() + poll_timeout
+        while True:
+            try:
+                job = await self._request("GET", poll_path)
+            except TimeoutError as e:  # asyncio timeouts bubbling out of the poll
+                raise DKGError(f"Timed out polling promote job {job_id}") from e
+            state = job.get("state")
+            if state == "succeeded":
+                return job
+            if state == "failed":
+                text = _job_error_text(job)
+                lowered = text.lower()
+                if "curator_unconfirmed" in lowered or "not confirmed by its curator" in lowered:
+                    raise CuratorUnconfirmedError(
+                        text or "curator did not confirm",
+                        code="CURATOR_UNCONFIRMED",
+                        context_graph_id=context_graph_id,
+                        body=job,
+                    )
+                if "curator_rejected" in lowered or "rejected by its curator" in lowered:
+                    raise CuratorRejectedError(
+                        text or "curator rejected the promote",
+                        code="CURATOR_REJECTED",
+                        context_graph_id=context_graph_id,
+                        body=job,
+                    )
+                raise DKGError(f"Promote job {job_id} failed: {text or job!r}")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise DKGError(
+                    f"Promote job {job_id} did not finish within {poll_timeout}s "
+                    f"(last state: {state!r})"
+                )
+            await asyncio.sleep(poll_interval)
 
     async def assertion_history(
         self, name: str, context_graph_id: str
     ) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            r = await http.get(
-                f"{self.base_url}/api/assertion/{name}/history",
-                headers=self._headers,
-                params={"contextGraphId": context_graph_id},
-            )
-            r.raise_for_status()
-            return r.json()
+        return await self._request(
+            "GET",
+            f"/api/assertion/{urllib.parse.quote(name, safe='')}/history",
+            params={"contextGraphId": context_graph_id},
+        )
 
     # ------------------------------------------------------------------
     # SPARQL query
@@ -347,14 +560,7 @@ class DKGClient:
             body["paranetId"] = paranet_id
         if graph_suffix:
             body["graphSuffix"] = graph_suffix
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            r = await http.post(
-                f"{self.base_url}/api/query",
-                headers=self._headers,
-                json=body,
-            )
-            r.raise_for_status()
-            return r.json()
+        return await self._request("POST", "/api/query", json_body=body)
 
     # ------------------------------------------------------------------
     # Shared Memory
@@ -373,15 +579,9 @@ class DKGClient:
         body: dict[str, Any] = {"quads": [_normalize_quad(q) for q in quads]}
         if context_graph_id:
             body["contextGraphId"] = context_graph_id
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            r = await http.post(
-                f"{self.base_url}/api/shared-memory/write",
-                headers=self._headers,
-                json=body,
-            )
-            _raise_for_curator_ack(r)
-            r.raise_for_status()
-            return r.json()
+        return await self._request(
+            "POST", "/api/shared-memory/write", json_body=body, curator_ack=True
+        )
 
     async def shared_memory_publish(
         self, context_graph_id: str | None = None
@@ -390,27 +590,24 @@ class DKGClient:
         body: dict[str, Any] = {}
         if context_graph_id:
             body["contextGraphId"] = context_graph_id
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            r = await http.post(
-                f"{self.base_url}/api/shared-memory/publish",
-                headers=self._headers,
-                json=body,
-            )
-            _raise_for_curator_ack(r)
-            r.raise_for_status()
-            return r.json()
+        return await self._request(
+            "POST", "/api/shared-memory/publish", json_body=body, curator_ack=True
+        )
 
     # ------------------------------------------------------------------
     # Health check
     # ------------------------------------------------------------------
 
     async def ping(self) -> bool:
-        """Return True if the node responds and the token is valid."""
+        """Return True if the node responds at ``GET /api/context-graph/list``.
+
+        Returns False only when the node cannot be reached (transport error or
+        timeout, using the client's configured timeout). Auth failures (401/403)
+        and other HTTP errors raise :class:`DKGStatusError` so a bad token is
+        distinguishable from a node that is down.
+        """
         try:
-            async with httpx.AsyncClient(timeout=5.0) as http:
-                r = await http.get(
-                    f"{self.base_url}/api/agents", headers=self._headers
-                )
-                return r.status_code == 200
-        except Exception:
+            await self._request("GET", "/api/context-graph/list")
+            return True
+        except DKGConnectionError:
             return False

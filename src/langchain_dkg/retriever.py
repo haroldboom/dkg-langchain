@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForRetrieverRun,
+    CallbackManagerForRetrieverRun,
+)
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
-from pydantic import ConfigDict
+from pydantic import ConfigDict, model_validator
 
 from ._sync import run_sync
 from .client import DKGClient
@@ -43,10 +44,9 @@ class DKGRetriever(BaseRetriever):
     Usage::
 
         from langchain_dkg import DKGRetriever
-        from langchain.chains import RetrievalQA
 
-        retriever = DKGRetriever(paranet_id="my-paranet")
-        chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
+        retriever = DKGRetriever(context_graph_id="my-project")
+        docs = retriever.invoke("wheat prices")
 
     Args:
         client: Pre-configured DKGClient (built from env vars if omitted).
@@ -56,9 +56,16 @@ class DKGRetriever(BaseRetriever):
         paranet_id: Optional paranet to scope the query.
         graph_suffix: Optional graph suffix.
         include_workspace: Whether to include Working Memory in results.
+        context_graph_id: Context Graph to scope the query — required by
+            current node builds to see workspace data.
+
+    Note:
+        Document metadata carries a coarse ``layer`` value ("workspace" when
+        ``include_workspace`` is set, else "published") reflecting the query
+        scope; per-triple layer provenance is not available from the node.
     """
 
-    client: Any = None
+    client: DKGClient | None = None
     sparql_template: str = _DEFAULT_SPARQL_TEMPLATE
     limit: int = 20
     paranet_id: str | None = None
@@ -68,10 +75,11 @@ class DKGRetriever(BaseRetriever):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    def __init__(self, **data: Any) -> None:
-        super().__init__(**data)
+    @model_validator(mode="after")
+    def _default_client(self) -> "DKGRetriever":
         if self.client is None:
             self.client = DKGClient()
+        return self
 
     def _get_relevant_documents(
         self,
@@ -85,7 +93,7 @@ class DKGRetriever(BaseRetriever):
         self,
         query: str,
         *,
-        run_manager: CallbackManagerForRetrieverRun | None = None,
+        run_manager: AsyncCallbackManagerForRetrieverRun,
     ) -> list[Document]:
         return await self._aget_relevant_documents_impl(query)
 
@@ -94,6 +102,7 @@ class DKGRetriever(BaseRetriever):
             query=_escape_sparql_literal(query),
             limit=self.limit,
         )
+        assert self.client is not None  # set by _default_client
         result = await self.client.query(
             sparql=sparql,
             paranet_id=self.paranet_id,
@@ -103,13 +112,20 @@ class DKGRetriever(BaseRetriever):
         )
         docs: list[Document] = []
         # Node builds < rc.19 return SPARQL-standard {"results": {"bindings"}};
-        # newer builds return {"result": {"bindings"}}.
-        bindings = (
-            result.get("results", {}).get("bindings")
-            or result.get("result", {}).get("bindings")
-            or []
-        )
+        # newer builds return {"result": {"bindings"}} — and some return the
+        # bindings list directly. Extract defensively.
+        container = result.get("result") or result.get("results")
+        if isinstance(container, dict):
+            bindings = container.get("bindings") or []
+        elif isinstance(container, list):
+            bindings = container
+        else:
+            bindings = []
+        if not isinstance(bindings, list):
+            bindings = []
         for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
             # SPARQL-standard cells are {"type": ..., "value": ...}; newer
             # node builds bind plain string values instead.
             values = {
@@ -131,7 +147,9 @@ class DKGRetriever(BaseRetriever):
                         "predicate": predicate,
                         "object": obj,
                         "source": "dkg-v10",
-                        "layer": "working" if self.include_workspace else "verified",
+                        # Coarse query-scope indicator; the node does not
+                        # report per-triple layer provenance.
+                        "layer": "workspace" if self.include_workspace else "published",
                     },
                 )
             )
@@ -139,12 +157,4 @@ class DKGRetriever(BaseRetriever):
 
     def with_sparql(self, sparql_template: str) -> "DKGRetriever":
         """Return a copy of this retriever with a custom SPARQL template."""
-        return DKGRetriever(
-            client=self.client,
-            sparql_template=sparql_template,
-            limit=self.limit,
-            paranet_id=self.paranet_id,
-            graph_suffix=self.graph_suffix,
-            include_workspace=self.include_workspace,
-            context_graph_id=self.context_graph_id,
-        )
+        return self.model_copy(update={"sparql_template": sparql_template})
