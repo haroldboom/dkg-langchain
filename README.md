@@ -84,6 +84,7 @@ chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
 | `DKGChatMessageHistory` | `BaseChatMessageHistory` | Stores turns in DKG WM; retrieves via tri-modal search |
 | `DKGMemory` | — | Factory for `RunnableWithMessageHistory` with DKG backend |
 | `DKGRetriever` | `BaseRetriever` | SPARQL retriever — returns triples as `Document` objects |
+| `DKGVerifiedRetriever` | `BaseRetriever` | SPARQL retriever over Verifiable Memory with a trust floor |
 | `DKGClient` | — | Low-level async HTTP client for the DKG v10 API |
 
 ## Memory layers
@@ -133,6 +134,62 @@ tri-modal search seeded by `search_query`, not a chronological dump.
   Graph — required by current node builds to see workspace (Working Memory)
   data.
 
+## Verifiable Memory (preview)
+
+The full promotion chain now runs end to end: draft in Working Memory →
+share to Shared Working Memory → publish to Verifiable Memory on-chain →
+endorse → M-of-N verify. Published content carries a trust level
+(`TrustLevel`: `SELF_ATTESTED` → `ENDORSED` → `PARTIALLY_VERIFIED` →
+`CONSENSUS_VERIFIED`) that queries can filter on.
+
+Promote a quad set in one call:
+
+```python
+from langchain_dkg import DKGClient, publish_to_verified, turn_to_quads
+
+client = DKGClient()
+quads = turn_to_quads("urn:turn:1", "**AI:** Yield was 4.2 t/ha.")  # minimal default shape
+receipt = await publish_to_verified(client, "my-project", "harvest-2026", quads)
+# receipt: kaId, ual, txHash, ... merged with the EIP-712 seal (eip712Digest, merkleRoot, ...)
+```
+
+This orchestrates `assertion_create` → `ka_write` → `ka_finalize` (the
+off-chain EIP-712 seal) → the async SWM share → `vm_publish`. Raise the trust
+level afterwards with `client.endorse(...)` (stamps *Endorsed*) and
+`client.request_verification(...)` (M-of-N verifier quorum → *ConsensusVerified*;
+a partial quorum is returned, not raised, so you can poll). Verify content
+locally against a published merkle root with `client.verify_batch(...)`, and
+fetch chain-side provenance via `client.kc_metadata(...)` / `client.kc_author(...)`.
+
+Retrieve only trusted knowledge with `DKGVerifiedRetriever` — like
+`DKGRetriever`, but scoped to the `"verifiable-memory"` query view with a
+trust floor:
+
+```python
+from langchain_dkg import DKGVerifiedRetriever, TrustLevel
+
+retriever = DKGVerifiedRetriever(context_graph_id="my-project", min_trust=TrustLevel.ENDORSED)
+docs = retriever.invoke("wheat prices")  # metadata: subject/predicate/object, source="dkg-v10-vm"
+```
+
+Hand the surface to an agent with `make_dkg_tools` (only needs
+`langchain_core`):
+
+```python
+from langchain_dkg import DKGClient, make_dkg_tools
+
+tools = make_dkg_tools(DKGClient(), "my-project")
+# dkg_endorse(ual), dkg_verified_search(query, min_trust="endorsed"),
+# dkg_publish_note(title, content)  — docstrings double as tool descriptions
+```
+
+> **Preview status:** this surface targets bounty **Round 2** and was built
+> against node build `10.0.2`. Publishing and endorsing hit the chain — the
+> node needs a **funded, publish-authorized wallet** (an unfunded wallet fails
+> with HTTP 400 and per-wallet balances in the body; a publish whose
+> preconditions aren't met — e.g. the SWM share hasn't landed yet — raises
+> `DKGPublishPreconditionError`).
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -176,9 +233,9 @@ Known limitations of node `10.0.2`:
   `/api/knowledge-assets` surface; this client targets the new routes and
   falls back to the legacy ones on 404. `assertion_write` /
   `assertion_history` / `shared_memory_publish` still target legacy routes
-  that 404 on `10.0.2` (the new equivalents are
-  `/api/knowledge-assets/{name}/wm/write` and the publish surface); they will
-  be ported in a future release.
+  that 404 on `10.0.2`; use the new equivalents instead — `ka_write`
+  (`/api/knowledge-assets/{name}/wm/write`) and the Verifiable Memory publish
+  surface (`vm_publish` / `publish_direct`, see above).
 
 ## Development
 

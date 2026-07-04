@@ -13,6 +13,7 @@ from langchain_dkg.client import (
     DKGClient,
     DKGConnectionError,
     DKGError,
+    DKGPublishPreconditionError,
     DKGStatusError,
 )
 
@@ -598,3 +599,358 @@ async def test_assertion_create_uses_knowledge_assets_route(client):
     assert result["status"] == "draft-open"
     body = json.loads(route.calls.last.request.content)
     assert body == {"contextGraphId": "cg-1", "name": "a1"}
+
+
+# ---------------------------------------------------------------------------
+# Verifiable Memory surface (node build 10.0.2)
+#
+# Draft lifecycle (wm/write → wm/finalize → vm/publish), the one-shot direct
+# publish, the trust-gradient calls (endorse / verify / kc provenance) and the
+# query view/minTrust extension.
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_assertion_create_one_shot_passthrough(client):
+    route = respx.post(f"{BASE}/api/knowledge-assets").mock(
+        return_value=httpx.Response(200, json={"name": "a1", "status": "draft-open"})
+    )
+    await client.assertion_create("cg-1", "a1", also_share_swm=True, also_publish_vm=True)
+    body = json.loads(route.calls.last.request.content)
+    assert body["alsoShareSwm"] is True
+    assert body["alsoPublishVm"] is True
+
+
+@respx.mock
+async def test_assertion_create_one_shot_partial_207_passthrough(client):
+    # A partial one-shot answers 207; the body is returned, not raised.
+    respx.post(f"{BASE}/api/knowledge-assets").mock(
+        return_value=httpx.Response(207, json={
+            "name": "a1", "status": "draft-open", "alreadyExists": False,
+        })
+    )
+    result = await client.assertion_create("cg-1", "a1", also_share_swm=True)
+    assert result["name"] == "a1"
+
+
+@respx.mock
+async def test_ka_write_sends_quads_objects(client):
+    route = respx.post(f"{BASE}/api/knowledge-assets/ka-1/wm/write").mock(
+        return_value=httpx.Response(200, json={"written": 2})
+    )
+    result = await client.ka_write(
+        name="ka-1",
+        context_graph_id="cg-1",
+        quads=[("ex:s", "ex:p", '"v"'), {"subject": "ex:s", "predicate": "ex:q", "object": "ex:o"}],
+    )
+    assert result["written"] == 2
+    body = json.loads(route.calls.last.request.content)
+    assert body["contextGraphId"] == "cg-1"
+    assert body["quads"] == [
+        {"subject": "ex:s", "predicate": "ex:p", "object": '"v"'},
+        {"subject": "ex:s", "predicate": "ex:q", "object": "ex:o"},
+    ]
+
+
+@respx.mock
+async def test_ka_write_url_quotes_name(client):
+    route = respx.post(f"{BASE}/api/knowledge-assets/turn%2Fpeer-ts/wm/write").mock(
+        return_value=httpx.Response(200, json={"written": 1})
+    )
+    await client.ka_write(name="turn/peer-ts", context_graph_id="cg-1", quads=[VALID_QUAD])
+    assert route.called
+
+
+@respx.mock
+async def test_ka_finalize_returns_seal(client):
+    route = respx.post(f"{BASE}/api/knowledge-assets/ka-1/wm/finalize").mock(
+        return_value=httpx.Response(200, json={
+            "assertionUri": "did:dkg:assertion:ka-1",
+            "merkleRoot": "0xroot",
+            "authorAddress": "0xauthor",
+            "schemeVersion": 1,
+            "chainId": 84532,
+            "kav10Address": "0xkav10",
+            "eip712Digest": "0xdigest",
+        })
+    )
+    seal = await client.ka_finalize("ka-1", "cg-1")
+    assert seal["eip712Digest"] == "0xdigest"
+    body = json.loads(route.calls.last.request.content)
+    assert body == {"contextGraphId": "cg-1"}
+
+
+@respx.mock
+async def test_ka_discard(client):
+    route = respx.post(f"{BASE}/api/knowledge-assets/ka-1/wm/discard").mock(
+        return_value=httpx.Response(200, json={"discarded": True})
+    )
+    await client.ka_discard("ka-1", "cg-1")
+    body = json.loads(route.calls.last.request.content)
+    assert body == {"contextGraphId": "cg-1"}
+
+
+@respx.mock
+async def test_vm_publish_happy_path(client):
+    route = respx.post(f"{BASE}/api/knowledge-assets/ka-1/vm/publish").mock(
+        return_value=httpx.Response(200, json={
+            "kaId": "ka-1",
+            "status": "confirmed",
+            "ual": "did:dkg:base:84532/0xabc/1",
+            "txHash": "0xtx",
+            "merkleRoot": "0xroot",
+            "authorAddress": "0xauthor",
+            "blockNumber": 42,
+        })
+    )
+    result = await client.vm_publish("ka-1", "cg-1", publish_epochs=2)
+    assert result["status"] == "confirmed"
+    assert result["ual"] == "did:dkg:base:84532/0xabc/1"
+    body = json.loads(route.calls.last.request.content)
+    assert body == {"contextGraphId": "cg-1", "publishEpochs": 2}
+
+
+@respx.mock
+async def test_vm_publish_omits_publish_epochs_by_default(client):
+    respx.post(f"{BASE}/api/knowledge-assets/ka-1/vm/publish").mock(
+        return_value=httpx.Response(200, json={"kaId": "ka-1", "status": "confirmed"})
+    )
+    await client.vm_publish("ka-1", "cg-1")
+    body = json.loads(respx.calls.last.request.content)
+    assert "publishEpochs" not in body
+
+
+@respx.mock
+async def test_vm_publish_207_partial_returned_not_raised(client):
+    # 207 = KA minted but the context-graph binding failed: pass through.
+    respx.post(f"{BASE}/api/knowledge-assets/ka-1/vm/publish").mock(
+        return_value=httpx.Response(207, json={
+            "kaId": "ka-1", "status": "partial", "ual": "did:dkg:base:84532/0xabc/1",
+        })
+    )
+    result = await client.vm_publish("ka-1", "cg-1")
+    assert result["status"] == "partial"
+
+
+@respx.mock
+@pytest.mark.parametrize("code", ["VM_PUBLISH_PRECONDITION", "PUBLISH_NOT_FULL_SHARE"])
+async def test_vm_publish_409_maps_precondition_error(client, code):
+    respx.post(f"{BASE}/api/knowledge-assets/ka-1/vm/publish").mock(
+        return_value=httpx.Response(409, json={"code": code, "message": "not ready"})
+    )
+    with pytest.raises(DKGPublishPreconditionError) as exc:
+        await client.vm_publish("ka-1", "cg-1")
+    err = exc.value
+    assert isinstance(err, DKGError)
+    assert err.code == code
+    assert err.status_code == 409
+    assert "not ready" in str(err)
+
+
+@respx.mock
+async def test_vm_publish_generic_409_stays_status_error(client):
+    # A 409 without a precondition code must not be mislabelled.
+    respx.post(f"{BASE}/api/knowledge-assets/ka-1/vm/publish").mock(
+        return_value=httpx.Response(409, json={"error": "conflict"})
+    )
+    with pytest.raises(DKGStatusError) as exc:
+        await client.vm_publish("ka-1", "cg-1")
+    assert not isinstance(exc.value, DKGPublishPreconditionError)
+
+
+@respx.mock
+async def test_vm_publish_400_unfunded_wallet_is_status_error(client):
+    respx.post(f"{BASE}/api/knowledge-assets/ka-1/vm/publish").mock(
+        return_value=httpx.Response(400, json={
+            "error": "insufficient funds",
+            "wallets": [{"address": "0xa", "trac": "0", "native": "0"}],
+        })
+    )
+    with pytest.raises(DKGStatusError) as exc:
+        await client.vm_publish("ka-1", "cg-1")
+    assert exc.value.status_code == 400
+    assert "insufficient funds" in exc.value.body
+
+
+@respx.mock
+async def test_vm_publish_502_tentative_failed_is_dkg_error(client):
+    respx.post(f"{BASE}/api/knowledge-assets/ka-1/vm/publish").mock(
+        return_value=httpx.Response(502, json={"error": "tentative-failed"})
+    )
+    with pytest.raises(DKGError):
+        await client.vm_publish("ka-1", "cg-1")
+
+
+@respx.mock
+async def test_publish_direct_full_body(client):
+    route = respx.post(f"{BASE}/api/knowledge-assets/publish").mock(
+        return_value=httpx.Response(200, json={
+            "mode": "direct",
+            "kaId": "ka-9",
+            "status": "confirmed",
+            "kas": [{"tokenId": 1, "rootEntity": "ex:s"}],
+            "txHash": "0xtx",
+        })
+    )
+    result = await client.publish_direct(
+        context_graph_id="cg-1",
+        quads=[("ex:s", "ex:p", '"v"')],
+        private_quads=[("ex:s", "ex:secret", '"w"')],
+        access_policy="allowList",
+        allowed_peers=["peer-1"],
+        sub_graph_name="sg",
+        publish_epochs=3,
+    )
+    assert result["mode"] == "direct"
+    body = json.loads(route.calls.last.request.content)
+    assert body["quads"] == [{"subject": "ex:s", "predicate": "ex:p", "object": '"v"'}]
+    assert body["privateQuads"] == [{"subject": "ex:s", "predicate": "ex:secret", "object": '"w"'}]
+    assert body["accessPolicy"] == "allowList"
+    assert body["allowedPeers"] == ["peer-1"]
+    assert body["subGraphName"] == "sg"
+    assert body["publishEpochs"] == 3
+
+
+@respx.mock
+async def test_publish_direct_minimal_body(client):
+    respx.post(f"{BASE}/api/knowledge-assets/publish").mock(
+        return_value=httpx.Response(200, json={"mode": "direct", "kaId": "ka-9", "status": "confirmed"})
+    )
+    await client.publish_direct(context_graph_id="cg-1", quads=[VALID_QUAD])
+    body = json.loads(respx.calls.last.request.content)
+    assert set(body) == {"contextGraphId", "quads"}
+
+
+@respx.mock
+async def test_endorse_sends_ual(client):
+    route = respx.post(f"{BASE}/api/endorse").mock(
+        return_value=httpx.Response(200, json={"status": "queued", "trustLevel": "Endorsed"})
+    )
+    result = await client.endorse("cg-1", "did:dkg:base:84532/0xabc/1")
+    assert result["trustLevel"] == "Endorsed"
+    body = json.loads(route.calls.last.request.content)
+    assert body == {"contextGraphId": "cg-1", "ual": "did:dkg:base:84532/0xabc/1"}
+
+
+@respx.mock
+async def test_endorse_identity_mismatch_surfaces_status_error(client):
+    respx.post(f"{BASE}/api/endorse").mock(
+        return_value=httpx.Response(403, json={"error": "identity mismatch"})
+    )
+    with pytest.raises(DKGStatusError) as exc:
+        await client.endorse("cg-1", "did:dkg:base:84532/0xabc/1")
+    assert exc.value.status_code == 403
+
+
+@respx.mock
+async def test_request_verification_quorum_met(client):
+    route = respx.post(f"{BASE}/api/verify").mock(
+        return_value=httpx.Response(200, json={"status": "verified", "signatures": 3})
+    )
+    result = await client.request_verification(
+        "cg-1", verifiable_memory_id="vm-1", batch_id="batch-1", required_signatures=3
+    )
+    assert result["status"] == "verified"
+    body = json.loads(route.calls.last.request.content)
+    assert body == {
+        "contextGraphId": "cg-1",
+        "verifiableMemoryId": "vm-1",
+        "batchId": "batch-1",
+        "requiredSignatures": 3,
+    }
+
+
+@respx.mock
+@pytest.mark.parametrize("status", ["partial", "no_quorum"])
+async def test_request_verification_409_returned_not_raised(client, status):
+    # Callers poll/retry on partial quorum — the body is returned, not raised.
+    respx.post(f"{BASE}/api/verify").mock(
+        return_value=httpx.Response(409, json={"status": status, "signatures": 1})
+    )
+    result = await client.request_verification("cg-1", verifiable_memory_id="vm-1", batch_id="b-1")
+    assert result["status"] == status
+
+
+@respx.mock
+async def test_request_verification_generic_409_raises(client):
+    respx.post(f"{BASE}/api/verify").mock(
+        return_value=httpx.Response(409, json={"error": "conflict"})
+    )
+    with pytest.raises(DKGStatusError):
+        await client.request_verification("cg-1", verifiable_memory_id="vm-1", batch_id="b-1")
+
+
+@respx.mock
+async def test_kc_metadata(client):
+    route = respx.get(f"{BASE}/api/kc/ka-1").mock(
+        return_value=httpx.Response(200, json={"merkleRoot": "0xroot", "author": "0xauthor"})
+    )
+    result = await client.kc_metadata("ka-1")
+    assert result["merkleRoot"] == "0xroot"
+    assert route.called
+
+
+@respx.mock
+async def test_kc_author(client):
+    respx.get(f"{BASE}/api/kc/ka-1/author").mock(
+        return_value=httpx.Response(200, json={"author": "0xauthor", "attested": True})
+    )
+    result = await client.kc_author("ka-1")
+    assert result["attested"] is True
+
+
+@respx.mock
+async def test_verify_batch_sends_expected_root(client):
+    route = respx.post(f"{BASE}/api/shared-memory/verify-batch").mock(
+        return_value=httpx.Response(200, json={"match": True, "computedRoot": "0xroot"})
+    )
+    result = await client.verify_batch(
+        quads=[("ex:s", "ex:p", '"v"')],
+        expected_merkle_root="0xroot",
+        private_roots=["0xpriv"],
+    )
+    assert result["match"] is True
+    body = json.loads(route.calls.last.request.content)
+    assert body == {
+        "quads": [{"subject": "ex:s", "predicate": "ex:p", "object": '"v"'}],
+        "expectedMerkleRoot": "0xroot",
+        "privateRoots": ["0xpriv"],
+    }
+
+
+@respx.mock
+async def test_query_sends_view_and_min_trust(client):
+    respx.post(f"{BASE}/api/query").mock(
+        return_value=httpx.Response(200, json={"result": {"bindings": []}})
+    )
+    await client.query(
+        sparql="SELECT * WHERE { ?s ?p ?o }",
+        context_graph_id="cg-1",
+        view="verifiable-memory",
+        min_trust="endorsed",
+    )
+    body = json.loads(respx.calls.last.request.content)
+    assert body["view"] == "verifiable-memory"
+    assert body["minTrust"] == "endorsed"
+
+
+@respx.mock
+async def test_query_min_trust_zero_is_sent(client):
+    # `is not None` semantics: SelfAttested (0) is falsy but must be sent.
+    respx.post(f"{BASE}/api/query").mock(
+        return_value=httpx.Response(200, json={"result": {"bindings": []}})
+    )
+    await client.query(sparql="SELECT * WHERE { ?s ?p ?o }", min_trust=0)
+    body = json.loads(respx.calls.last.request.content)
+    assert body["minTrust"] == 0
+
+
+@respx.mock
+async def test_query_omits_view_and_min_trust_by_default(client):
+    respx.post(f"{BASE}/api/query").mock(
+        return_value=httpx.Response(200, json={"result": {"bindings": []}})
+    )
+    await client.query(sparql="SELECT * WHERE { ?s ?p ?o }")
+    body = json.loads(respx.calls.last.request.content)
+    assert "view" not in body
+    assert "minTrust" not in body

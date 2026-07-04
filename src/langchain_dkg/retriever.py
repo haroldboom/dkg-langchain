@@ -35,6 +35,47 @@ def _escape_sparql_literal(s: str) -> str:
     )
 
 
+def _parse_triple_bindings(result: dict) -> list[dict[str, str]]:
+    """Extract SPARQL bindings from a node query response as plain value dicts.
+
+    Node builds < rc.19 return SPARQL-standard ``{"results": {"bindings"}}``;
+    newer builds return ``{"result": {"bindings"}}`` — and some return the
+    bindings list directly. Cells are either SPARQL-standard
+    ``{"type": ..., "value": ...}`` objects or plain strings (newer builds).
+    Extract defensively; malformed rows are skipped.
+    """
+    container = result.get("result") or result.get("results")
+    if isinstance(container, dict):
+        bindings = container.get("bindings") or []
+    elif isinstance(container, list):
+        bindings = container
+    else:
+        bindings = []
+    if not isinstance(bindings, list):
+        bindings = []
+    rows: list[dict[str, str]] = []
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            continue
+        rows.append(
+            {
+                var: cell.get("value", "") if isinstance(cell, dict) else str(cell)
+                for var, cell in binding.items()
+            }
+        )
+    return rows
+
+
+def _triple_page_content(values: dict[str, str]) -> str:
+    """Render one bound row as Document page content (subject predicate object)."""
+    subject = values.get("subject", "")
+    predicate = values.get("predicate", "")
+    obj = values.get("object", "")
+    if subject or predicate or obj:
+        return f"{subject} {predicate} {obj}".strip()
+    return " ".join(values.values()).strip()
+
+
 class DKGRetriever(BaseRetriever):
     """LangChain BaseRetriever that executes SPARQL queries against DKG v10.
 
@@ -111,41 +152,14 @@ class DKGRetriever(BaseRetriever):
             context_graph_id=self.context_graph_id,
         )
         docs: list[Document] = []
-        # Node builds < rc.19 return SPARQL-standard {"results": {"bindings"}};
-        # newer builds return {"result": {"bindings"}} — and some return the
-        # bindings list directly. Extract defensively.
-        container = result.get("result") or result.get("results")
-        if isinstance(container, dict):
-            bindings = container.get("bindings") or []
-        elif isinstance(container, list):
-            bindings = container
-        else:
-            bindings = []
-        if not isinstance(bindings, list):
-            bindings = []
-        for binding in bindings:
-            if not isinstance(binding, dict):
-                continue
-            # SPARQL-standard cells are {"type": ..., "value": ...}; newer
-            # node builds bind plain string values instead.
-            values = {
-                var: cell.get("value", "") if isinstance(cell, dict) else str(cell)
-                for var, cell in binding.items()
-            }
-            subject = values.get("subject", "")
-            predicate = values.get("predicate", "")
-            obj = values.get("object", "")
-            if subject or predicate or obj:
-                page_content = f"{subject} {predicate} {obj}".strip()
-            else:
-                page_content = " ".join(values.values()).strip()
+        for values in _parse_triple_bindings(result):
             docs.append(
                 Document(
-                    page_content=page_content,
+                    page_content=_triple_page_content(values),
                     metadata={
-                        "subject": subject,
-                        "predicate": predicate,
-                        "object": obj,
+                        "subject": values.get("subject", ""),
+                        "predicate": values.get("predicate", ""),
+                        "object": values.get("object", ""),
                         "source": "dkg-v10",
                         # Coarse query-scope indicator; the node does not
                         # report per-triple layer provenance.

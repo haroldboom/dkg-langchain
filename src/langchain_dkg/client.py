@@ -85,6 +85,37 @@ class CuratorRejectedError(CuratorAckError):
     """HTTP 409 ``CURATOR_REJECTED`` — the curator actively rejected the write."""
 
 
+class DKGPublishPreconditionError(DKGError):
+    """A VM publish was refused because its preconditions are not met (HTTP 409).
+
+    The DKG v10 node's ``POST /api/knowledge-assets/{name}/vm/publish`` route
+    returns 409 with a structured ``code`` when the Knowledge Asset is not
+    ready to publish — ``VM_PUBLISH_PRECONDITION`` (e.g. the assertion was
+    never finalized) or ``PUBLISH_NOT_FULL_SHARE`` (the SWM share has not
+    fully landed on the network yet). Both are typically retryable once the
+    missing step completes.
+
+    Attributes:
+        code: The node's machine code (``VM_PUBLISH_PRECONDITION`` /
+            ``PUBLISH_NOT_FULL_SHARE``).
+        status_code: The HTTP status code, if the failure came from an HTTP response.
+        body: The parsed response body, if available.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        status_code: int | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+        self.body = body
+
+
 def _raise_for_curator_ack(r: httpx.Response) -> None:
     """Map the node's OT-RFC-49 curator-ack failures to typed exceptions.
 
@@ -371,16 +402,32 @@ class DKGClient:
         context_graph_id: str,
         name: str,
         sub_graph_name: str | None = None,
+        also_share_swm: bool | None = None,
+        also_publish_vm: bool | None = None,
     ) -> dict[str, Any]:
         """Create a named Working Memory assertion (Knowledge Asset).
 
         Current node builds serve this as ``POST /api/knowledge-assets``; the
         legacy ``POST /api/assertion/create`` route is used as a fallback for
         older builds. The response shape follows whichever route answered.
+
+        Args:
+            context_graph_id: Context Graph that owns the assertion.
+            name: Assertion name.
+            sub_graph_name: Optional sub-graph within the Context Graph.
+            also_share_swm: One-shot passthrough — also share the asset to
+                Shared Working Memory on creation (node build 10.0.2+). A
+                partial one-shot returns HTTP 207, which is passed through.
+            also_publish_vm: One-shot passthrough — also publish the asset to
+                Verifiable Memory on creation (node build 10.0.2+).
         """
         body: dict[str, Any] = {"contextGraphId": context_graph_id, "name": name}
         if sub_graph_name:
             body["subGraphName"] = sub_graph_name
+        if also_share_swm is not None:
+            body["alsoShareSwm"] = also_share_swm
+        if also_publish_vm is not None:
+            body["alsoPublishVm"] = also_publish_vm
         try:
             return await self._request("POST", "/api/knowledge-assets", json_body=body)
         except DKGStatusError as e:
@@ -539,6 +586,206 @@ class DKGClient:
         )
 
     # ------------------------------------------------------------------
+    # Knowledge Assets — Working Memory draft lifecycle & Verifiable Memory
+    # ------------------------------------------------------------------
+
+    async def ka_write(
+        self,
+        name: str,
+        context_graph_id: str,
+        quads: list[QuadLike],
+    ) -> dict[str, Any]:
+        """Write RDF quads into a draft Knowledge Asset's Working Memory.
+
+        Quads follow the same shape as :meth:`shared_memory_write` — a mapping with
+        ``subject``/``predicate``/``object`` (optional ``graph``) keys, or a 3-/4-tuple.
+
+        Returns dict with key: written (quad count).
+        """
+        body: dict[str, Any] = {
+            "contextGraphId": context_graph_id,
+            "quads": [_normalize_quad(q) for q in quads],
+        }
+        return await self._request(
+            "POST",
+            f"/api/knowledge-assets/{urllib.parse.quote(name, safe='')}/wm/write",
+            json_body=body,
+        )
+
+    async def ka_finalize(self, name: str, context_graph_id: str) -> dict[str, Any]:
+        """Finalize a draft Knowledge Asset — the off-chain EIP-712 seal.
+
+        Returns dict with keys: assertionUri, merkleRoot, authorAddress,
+        schemeVersion, chainId, kav10Address, eip712Digest.
+        """
+        return await self._request(
+            "POST",
+            f"/api/knowledge-assets/{urllib.parse.quote(name, safe='')}/wm/finalize",
+            json_body={"contextGraphId": context_graph_id},
+        )
+
+    async def ka_discard(self, name: str, context_graph_id: str) -> dict[str, Any]:
+        """Discard a draft Knowledge Asset from Working Memory."""
+        return await self._request(
+            "POST",
+            f"/api/knowledge-assets/{urllib.parse.quote(name, safe='')}/wm/discard",
+            json_body={"contextGraphId": context_graph_id},
+        )
+
+    async def vm_publish(
+        self,
+        name: str,
+        context_graph_id: str,
+        publish_epochs: int | None = None,
+    ) -> dict[str, Any]:
+        """Publish a shared Knowledge Asset to Verifiable Memory (on-chain, costs TRAC).
+
+        Returns the node response — on 200 a confirmed publish
+        (``{kaId, status: "confirmed", ual, txHash, ...}``); an HTTP 207
+        (KA minted but the context-graph binding failed) is passed through
+        as-is rather than raised, so callers can inspect and repair.
+
+        Raises:
+            DKGPublishPreconditionError: HTTP 409 with code
+                ``VM_PUBLISH_PRECONDITION`` / ``PUBLISH_NOT_FULL_SHARE`` —
+                the asset is not ready to publish (retryable once the
+                missing step completes).
+            DKGStatusError: any other non-2xx status, including 400 for an
+                unfunded wallet (per-wallet balances in the body) and 502
+                for a tentative-failed publish.
+        """
+        body: dict[str, Any] = {"contextGraphId": context_graph_id}
+        if publish_epochs is not None:
+            body["publishEpochs"] = publish_epochs
+        try:
+            return await self._request(
+                "POST",
+                f"/api/knowledge-assets/{urllib.parse.quote(name, safe='')}/vm/publish",
+                json_body=body,
+            )
+        except DKGStatusError as e:
+            if e.status_code == 409:
+                try:
+                    parsed = json.loads(e.body)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict) and parsed.get("code") in (
+                    "VM_PUBLISH_PRECONDITION",
+                    "PUBLISH_NOT_FULL_SHARE",
+                ):
+                    raise DKGPublishPreconditionError(
+                        parsed.get("message") or parsed.get("error") or parsed["code"],
+                        code=parsed["code"],
+                        status_code=e.status_code,
+                        body=parsed,
+                    ) from e
+            raise
+
+    async def publish_direct(
+        self,
+        context_graph_id: str,
+        quads: list[QuadLike],
+        private_quads: list[QuadLike] | None = None,
+        access_policy: str | None = None,
+        allowed_peers: list[str] | None = None,
+        sub_graph_name: str | None = None,
+        publish_epochs: int | None = None,
+    ) -> dict[str, Any]:
+        """One-shot direct publish of quads to Verifiable Memory (on-chain, costs TRAC).
+
+        Args:
+            context_graph_id: Context Graph that scopes the publish.
+            quads: Public quads (same shape as :meth:`shared_memory_write`).
+            private_quads: Optional quads kept private (merkle-rooted only).
+            access_policy: "public", "ownerOnly", or "allowList".
+            allowed_peers: Peer allowlist when ``access_policy="allowList"``.
+            sub_graph_name: Optional sub-graph within the Context Graph.
+            publish_epochs: Number of epochs to fund the publish for.
+
+        Returns dict with keys: mode ("direct"), kaId, status,
+            kas ([{tokenId, rootEntity}]), txHash?, blockNumber?.
+        """
+        body: dict[str, Any] = {
+            "contextGraphId": context_graph_id,
+            "quads": [_normalize_quad(q) for q in quads],
+        }
+        if private_quads is not None:
+            body["privateQuads"] = [_normalize_quad(q) for q in private_quads]
+        if access_policy:
+            body["accessPolicy"] = access_policy
+        if allowed_peers is not None:
+            body["allowedPeers"] = allowed_peers
+        if sub_graph_name:
+            body["subGraphName"] = sub_graph_name
+        if publish_epochs is not None:
+            body["publishEpochs"] = publish_epochs
+        return await self._request("POST", "/api/knowledge-assets/publish", json_body=body)
+
+    # ------------------------------------------------------------------
+    # Trust gradient — endorse / verify / provenance
+    # ------------------------------------------------------------------
+
+    async def endorse(self, context_graph_id: str, ual: str) -> dict[str, Any]:
+        """Endorse a published Knowledge Asset (stamps trust level Endorsed).
+
+        Writes ``dkg:endorses`` triples that ride the next publish batch. The
+        endorser identity comes from the client's bearer token; the node
+        answers 401/403 on an identity mismatch (raised as
+        :class:`DKGStatusError`).
+        """
+        return await self._request(
+            "POST",
+            "/api/endorse",
+            json_body={"contextGraphId": context_graph_id, "ual": ual},
+        )
+
+    async def request_verification(
+        self,
+        context_graph_id: str,
+        verifiable_memory_id: str,
+        batch_id: str,
+        required_signatures: int | None = None,
+    ) -> dict[str, Any]:
+        """Request M-of-N verification of a Verifiable Memory batch.
+
+        Returns the node response: on 200 the quorum was met and anchored
+        on-chain (``{"status": "verified", ...}`` — trust level
+        ConsensusVerified). An HTTP 409 whose body carries ``status``
+        ``"partial"`` or ``"no_quorum"`` is returned (not raised) so callers
+        can poll/retry until the quorum lands.
+        """
+        body: dict[str, Any] = {
+            "contextGraphId": context_graph_id,
+            "verifiableMemoryId": verifiable_memory_id,
+            "batchId": batch_id,
+        }
+        if required_signatures is not None:
+            body["requiredSignatures"] = required_signatures
+        try:
+            return await self._request("POST", "/api/verify", json_body=body)
+        except DKGStatusError as e:
+            if e.status_code == 409:
+                try:
+                    parsed = json.loads(e.body)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict) and parsed.get("status") in ("partial", "no_quorum"):
+                    return parsed
+            raise
+
+    async def kc_metadata(self, ka_id: str) -> dict[str, Any]:
+        """Fetch chain-latest metadata for a Knowledge Collection (merkleRoot, author, ...)."""
+        return await self._request(
+            "GET", f"/api/kc/{urllib.parse.quote(ka_id, safe='')}"
+        )
+
+    async def kc_author(self, ka_id: str) -> dict[str, Any]:
+        """Fetch the attested author of a Knowledge Collection ({author, attested})."""
+        return await self._request(
+            "GET", f"/api/kc/{urllib.parse.quote(ka_id, safe='')}/author"
+        )
+
+    # ------------------------------------------------------------------
     # SPARQL query
     # ------------------------------------------------------------------
 
@@ -549,7 +796,24 @@ class DKGClient:
         graph_suffix: str | None = None,
         include_workspace: bool = True,
         context_graph_id: str | None = None,
+        view: str | None = None,
+        min_trust: int | str | None = None,
     ) -> dict[str, Any]:
+        """Execute a SPARQL query against the node.
+
+        Args:
+            sparql: The SPARQL query text.
+            paranet_id: Optional paranet to scope the query.
+            graph_suffix: Optional graph suffix.
+            include_workspace: Whether to include Working Memory in results.
+            context_graph_id: Context Graph to scope the query.
+            view: Optional query view — ``"verifiable-memory"`` restricts
+                results to on-chain-anchored Verifiable Memory content.
+            min_trust: Minimum trust level for verifiable-memory views — a
+                :class:`~langchain_dkg.trust.TrustLevel` / int (0-3) or a
+                string name (e.g. ``"endorsed"``). The node fails closed
+                (HTTP 400) on values it does not recognize.
+        """
         body: dict[str, Any] = {
             "sparql": sparql,
             "includeWorkspace": include_workspace,
@@ -560,6 +824,10 @@ class DKGClient:
             body["paranetId"] = paranet_id
         if graph_suffix:
             body["graphSuffix"] = graph_suffix
+        if view:
+            body["view"] = view
+        if min_trust is not None:
+            body["minTrust"] = min_trust
         return await self._request("POST", "/api/query", json_body=body)
 
     # ------------------------------------------------------------------
@@ -593,6 +861,26 @@ class DKGClient:
         return await self._request(
             "POST", "/api/shared-memory/publish", json_body=body, curator_ack=True
         )
+
+    async def verify_batch(
+        self,
+        quads: list[QuadLike],
+        expected_merkle_root: str,
+        private_roots: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Locally recompute a merkle root over quads and compare to an expected root.
+
+        This is the node's off-chain integrity check
+        (``POST /api/shared-memory/verify-batch``): no chain interaction, no
+        TRAC spend. Quads follow the same shape as :meth:`shared_memory_write`.
+        """
+        body: dict[str, Any] = {
+            "quads": [_normalize_quad(q) for q in quads],
+            "expectedMerkleRoot": expected_merkle_root,
+        }
+        if private_roots is not None:
+            body["privateRoots"] = private_roots
+        return await self._request("POST", "/api/shared-memory/verify-batch", json_body=body)
 
     # ------------------------------------------------------------------
     # Health check
